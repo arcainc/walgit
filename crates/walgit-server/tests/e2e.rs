@@ -966,6 +966,67 @@ async fn lfs_roundtrip_when_available() -> TestResult {
     Ok(())
 }
 
+/// LFS batch authorization follows the requested operation. A read-only
+/// principal may discover downloads but must not receive upload actions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfs_upload_batch_requires_write_permission() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "writer@example.com".into(),
+                token: "writer".into(),
+                token_env: None,
+                write: true,
+            },
+            walgit_config::StaticToken {
+                principal: "reader@example.com".into(),
+                token: "reader".into(),
+                token_env: None,
+                write: false,
+            },
+        ];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+    let create = client
+        .put(format!("{}/t/lfs-auth.git", server.base_url))
+        .bearer_auth("writer")
+        .send()
+        .await?;
+    assert!(create.status().is_success(), "{}", create.status());
+
+    let batch_url = format!("{}/t/lfs-auth.git/info/lfs/objects/batch", server.base_url);
+    let object = serde_json::json!({
+        "objects": [{"oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1}]
+    });
+    let upload = client
+        .post(&batch_url)
+        .bearer_auth("reader")
+        .json(&serde_json::json!({"operation": "upload", "objects": object["objects"]}))
+        .send()
+        .await?;
+    assert_eq!(upload.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let download = client
+        .post(&batch_url)
+        .bearer_auth("reader")
+        .json(&serde_json::json!({"operation": "download", "objects": object["objects"]}))
+        .send()
+        .await?;
+    assert_eq!(download.status(), reqwest::StatusCode::OK);
+
+    let unsupported = client
+        .post(&batch_url)
+        .bearer_auth("writer")
+        .json(&serde_json::json!({"operation": "delete", "objects": object["objects"]}))
+        .send()
+        .await?;
+    assert_eq!(unsupported.status(), reqwest::StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bundle_endpoints_when_landed() -> TestResult {
     let server = Server::start().await?;
