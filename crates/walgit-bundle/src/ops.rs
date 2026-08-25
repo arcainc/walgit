@@ -529,8 +529,49 @@ pub async fn hold_lease(
     holder: &str,
     ttl: Duration,
 ) -> Result<Version, BundleError> {
-    let key = format!("{}bundle-{strategy}.pb", keys::LEASES_DIR);
+    const LEASE_SKEW_TOLERANCE: Duration = Duration::from_secs(2);
+
+    let relative_key = format!("{}bundle-{strategy}.pb", keys::LEASES_DIR);
+    let key = format!("{}{}", store.prefix(), relative_key);
     let now = SystemTime::now();
+    let current = walgit_store::coord::get_message::<Lease>(store.inner().as_ref(), &key)
+        .await
+        .map_err(|e| BundleError::Other(e.to_string()))?;
+    let mode = match current {
+        None => PutMode::Create,
+        Some((meta, existing)) => {
+            let expires_at = existing
+                .expires_at
+                .as_ref()
+                .map(time::to_system)
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if now < expires_at + LEASE_SKEW_TOLERANCE {
+                return Err(BundleError::Other("lease already held".into()));
+            }
+            let lease = Lease {
+                holder: holder.to_string(),
+                purpose: format!("bundle-{strategy}"),
+                acquired_at: Some(time::from_system(now)),
+                expires_at: Some(time::from_system(now + ttl)),
+                epoch: existing.epoch + 1,
+            };
+            let meta = store
+                .put(
+                    &relative_key,
+                    PutBody::from(lease.encode_to_vec()),
+                    PutOptions::from(PutMode::Update(meta.version)),
+                )
+                .await
+                .map_err(|e| {
+                    if e.is_precondition_failed() {
+                        BundleError::Other("lease already held".into())
+                    } else {
+                        BundleError::from(e)
+                    }
+                })?;
+            return Ok(meta.version);
+        }
+    };
     let lease = Lease {
         holder: holder.to_string(),
         purpose: format!("bundle-{strategy}"),
@@ -540,9 +581,9 @@ pub async fn hold_lease(
     };
     let meta = store
         .put(
-            &key,
+            &relative_key,
             PutBody::from(lease.encode_to_vec()),
-            PutOptions::from(PutMode::Create),
+            PutOptions::from(mode),
         )
         .await
         .map_err(|e| {

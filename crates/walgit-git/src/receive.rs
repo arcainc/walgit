@@ -41,6 +41,14 @@ pub struct PrefixedReader<R: AsyncRead + Unpin> {
     inner: R,
 }
 
+impl<R: AsyncRead + Unpin> std::fmt::Debug for PrefixedReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefixedReader")
+            .field("prefix_len", &self.prefix.len())
+            .finish()
+    }
+}
+
 impl<R: AsyncRead + Unpin> PrefixedReader<R> {
     pub fn new(prefix: Vec<u8>, inner: R) -> Self {
         PrefixedReader {
