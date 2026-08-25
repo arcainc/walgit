@@ -5,6 +5,11 @@
 //! read-modify-write loop that re-reads on `PreconditionFailed` and backs off
 //! on `Retryable`. Leases are protobuf objects under `leases/` acquired by
 //! `Create` or by `Update` over an expired lease, renewed by CAS heartbeat.
+//!
+//! Lease keys are never physically deleted. Release is a CAS write of an
+//! already-expired tombstone. This matters for S3-compatible stores: their
+//! `HEAD` + `DELETE` emulation is not atomic, so a stale holder could delete a
+//! newer lease after a successor had reclaimed the key.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -157,6 +162,35 @@ fn make_lease(holder: &str, purpose: &str, now: SystemTime, ttl: Duration, epoch
     }
 }
 
+fn released_lease(purpose: &str, epoch: u64) -> Lease {
+    Lease {
+        holder: String::new(),
+        purpose: purpose.to_string(),
+        acquired_at: None,
+        expires_at: Some(time::from_system(UNIX_EPOCH)),
+        epoch,
+    }
+}
+
+async fn release_lease(
+    store: &dyn ObjectStore,
+    key: &str,
+    purpose: &str,
+    version: Version,
+    epoch: u64,
+) -> Result<(), CoordError> {
+    let tombstone = released_lease(purpose, epoch).encode_to_vec();
+    match store
+        .put_bytes(key, tombstone, PutMode::Update(version))
+        .await
+    {
+        Ok(_) | Err(StoreError::PreconditionFailed { .. }) | Err(StoreError::NotFound { .. }) => {
+            Ok(())
+        }
+        Err(e) => Err(CoordError::Store(e)),
+    }
+}
+
 /// A held lease. Drop performs a best-effort release when inside a Tokio
 /// runtime; call [`LeaseGuard::release`] for a confirmed release.
 pub struct LeaseGuard {
@@ -217,20 +251,19 @@ impl LeaseGuard {
         }
     }
 
-    /// Confirmed CAS delete. Consumes the guard. `Ok(())` even if the lease was
-    /// already stolen (the desired end state — no one holds it in our name).
+    /// Confirmed CAS release. Consumes the guard. `Ok(())` even if the lease
+    /// was already stolen (the desired end state — no one holds it in our
+    /// name).
     pub async fn release(self) -> Result<(), CoordError> {
         self.released.store(true, Ordering::SeqCst);
-        match self
-            .store
-            .delete(&self.key, Some(self.version.clone()))
-            .await
-        {
-            Ok(())
-            | Err(StoreError::PreconditionFailed { .. })
-            | Err(StoreError::NotFound { .. }) => Ok(()),
-            Err(e) => Err(CoordError::Store(e)),
-        }
+        release_lease(
+            self.store.as_ref(),
+            &self.key,
+            &self.purpose,
+            self.version.clone(),
+            self.epoch,
+        )
+        .await
     }
 
     /// Spawn a background task that calls [`heartbeat`](Self::heartbeat) every
@@ -284,10 +317,12 @@ impl Drop for LeaseGuard {
         // Best-effort release when inside a Tokio runtime.
         let store = self.store.clone();
         let key = self.key.clone();
+        let purpose = self.purpose.clone();
         let version = self.version.clone();
+        let epoch = self.epoch;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = handle.spawn(async move {
-                let _ = store.delete(&key, Some(version)).await;
+                let _ = release_lease(store.as_ref(), &key, &purpose, version, epoch).await;
             });
         }
     }
@@ -415,6 +450,81 @@ mod tests {
     use super::*;
     use crate::memory::MemoryStore;
     use walgit_proto::v1::RepoCatalog;
+
+    /// Reproduces the S3 conditional-delete implementation: it observes the
+    /// expected version, pauses, then performs an unconditional delete. The
+    /// pause lets a successor CAS-steal an expired lease in the middle of the
+    /// stale holder's release.
+    struct HeadThenDeleteStore {
+        inner: Arc<MemoryStore>,
+        head_observed: Arc<tokio::sync::Notify>,
+        allow_delete: Arc<tokio::sync::Notify>,
+    }
+
+    impl HeadThenDeleteStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(MemoryStore::new()),
+                head_observed: Arc::new(tokio::sync::Notify::new()),
+                allow_delete: Arc::new(tokio::sync::Notify::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for HeadThenDeleteStore {
+        fn backend(&self) -> &'static str {
+            "s3-race"
+        }
+
+        async fn get(&self, key: &str, opts: crate::GetOptions) -> crate::Result<crate::GetResult> {
+            self.inner.get(key, opts).await
+        }
+
+        async fn head(&self, key: &str) -> crate::Result<Option<crate::ObjectMeta>> {
+            self.inner.head(key).await
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            body: crate::PutBody,
+            opts: crate::PutOptions,
+        ) -> crate::Result<crate::ObjectMeta> {
+            self.inner.put(key, body, opts).await
+        }
+
+        async fn delete(&self, key: &str, if_version: Option<crate::Version>) -> crate::Result<()> {
+            if let Some(want) = if_version {
+                let current = self
+                    .inner
+                    .head(key)
+                    .await?
+                    .ok_or_else(|| crate::StoreError::NotFound { key: key.into() })?;
+                if current.version != want {
+                    return Err(crate::StoreError::PreconditionFailed {
+                        key: key.into(),
+                        current: Some(current.version),
+                    });
+                }
+                self.head_observed.notify_one();
+                self.allow_delete.notified().await;
+            }
+            self.inner.delete(key, None).await
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+        ) -> crate::BoxStream<'static, crate::Result<crate::ObjectMeta>> {
+            self.inner.list(prefix, start_after)
+        }
+
+        async fn list_prefixes(&self, prefix: &str) -> crate::Result<Vec<String>> {
+            self.inner.list_prefixes(prefix).await
+        }
+    }
 
     fn dyn_store() -> DynStore {
         MemoryStore::shared() as DynStore
@@ -559,6 +669,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(g2.holder(), "h2");
+    }
+
+    #[tokio::test]
+    async fn stale_owner_release_cannot_delete_reclaimed_lease() {
+        let race = HeadThenDeleteStore::new();
+        let store: DynStore = race.clone();
+        let key = "leases/stale-release.pb";
+
+        let g1 = try_acquire(store.clone(), key, "h1", "test", Duration::from_millis(20))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(LEASE_SKEW_TOLERANCE + Duration::from_millis(50)).await;
+
+        let release = tokio::spawn(async move { g1.release().await });
+        let observed_unsafe_delete =
+            tokio::time::timeout(Duration::from_millis(250), race.head_observed.notified())
+                .await
+                .is_ok();
+
+        // The unfixed S3 path pauses here after HEAD. Let the successor steal
+        // the expired lease, then allow the stale DELETE to run.
+        let g2 = if observed_unsafe_delete {
+            let g2 = try_acquire(store.clone(), key, "h2", "test", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .unwrap();
+            race.allow_delete.notify_one();
+            g2
+        } else {
+            // The safe path released with a conditional PUT and never called
+            // delete; it should make the key immediately reusable.
+            try_acquire(store.clone(), key, "h2", "test", Duration::from_secs(30))
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        release.await.unwrap().unwrap();
+
+        let mut g2 = g2;
+        g2.heartbeat(Duration::from_secs(30)).await.unwrap();
     }
 
     #[tokio::test]

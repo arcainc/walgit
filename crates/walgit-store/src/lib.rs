@@ -215,8 +215,12 @@ pub trait ObjectStore: Send + Sync + 'static {
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta>;
 
-    /// Delete. `if_version` = CAS delete. Deleting an absent object is `Ok(())`
-    /// when unconditional and `NotFound` when conditional.
+    /// Delete. `if_version` requests a version check before deletion. Backends
+    /// with native conditional delete make that check atomic; the S3 backend
+    /// must emulate it with `HEAD` + `DELETE`, so this operation is not safe
+    /// for reusable coordination keys. Use a conditional PUT tombstone for
+    /// leases and other mutable ownership records. Deleting an absent object
+    /// is `Ok(())` when unconditional and `NotFound` when conditional.
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()>;
 
     /// Lexicographically ordered listing of keys with `prefix`, starting after

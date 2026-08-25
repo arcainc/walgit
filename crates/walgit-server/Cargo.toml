@@ -58,6 +58,7 @@ moka.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
 base64.workspace = true
+tempfile.workspace = true
 
 bytesize.workspace = true
 rustls.workspace = true
@@ -65,6 +66,5 @@ rustls-pemfile.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true
 [dev-dependencies]
-tempfile.workspace = true
 reqwest.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }

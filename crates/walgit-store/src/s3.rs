@@ -22,9 +22,9 @@
 //! ## Conditional DELETE
 //!
 //! S3 has no native conditional delete. We emulate via HEAD (read ETag) +
-//! compare + DELETE, documenting the inherent check-then-act race: a
-//! concurrent writer could replace the object between HEAD and DELETE.
-//! Acceptable for walgit's lease-guarded semantics.
+//! compare + DELETE. This is a check-then-act operation: a concurrent writer
+//! can replace the object between HEAD and DELETE. Coordination code must not
+//! use this for reusable keys; leases use a conditional PUT tombstone instead.
 //!
 //! ## Multipart upload
 //!
@@ -358,8 +358,9 @@ impl ObjectStore for S3Store {
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
         if let Some(want) = &if_version {
             // S3 has no conditional delete: emulate via HEAD + compare + DELETE.
-            // RACE: a concurrent writer could replace the object between HEAD
-            // and DELETE. Acceptable for walgit's lease-guarded semantics.
+            // RACE: a concurrent writer can replace the object between HEAD
+            // and DELETE. Callers must reserve this for immutable or
+            // otherwise non-reusable objects.
             let head = self.head(key).await?;
             match head {
                 None => return Err(StoreError::NotFound { key: key.into() }),

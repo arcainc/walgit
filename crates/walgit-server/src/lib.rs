@@ -318,8 +318,8 @@ async fn dispatch(
 
 pub(crate) fn request_peer(req: &Request<Body>) -> Option<SocketAddr> {
     req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0)
+        .get::<ConnectInfo<RequestPeer>>()
+        .map(|c| c.0.0)
 }
 
 /// Route a parsed repo request (`/{owner}/{repo}[.git]/<sub>` or the same sub
@@ -513,6 +513,17 @@ impl axum::serve::Listener for NodelayListener {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RequestPeer(std::net::SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NodelayListener>>
+    for RequestPeer
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, NodelayListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
 /// Bind, serve (HTTP/1.1 + h2c, or TLS with ALPN h2/http1.1 when
 /// `server.tls` is on), graceful shutdown on `shutdown`.
 pub async fn serve(
@@ -582,7 +593,7 @@ pub async fn serve(
             None => {
                 axum::serve(
                     NodelayListener(listener),
-                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    app.into_make_service_with_connect_info::<RequestPeer>(),
                 )
                 .with_graceful_shutdown(graceful)
                 .await
