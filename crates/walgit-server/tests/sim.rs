@@ -1625,7 +1625,11 @@ async fn liveness_bundle_build_after_lease_holder_dies() -> Result<()> {
             .is_empty(),
         "built while dead holder's lease was live"
     );
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    // The shared fenced lease protocol deliberately waits through its
+    // clock-skew tolerance before stealing an expired lease. Keep this as a
+    // real liveness test rather than weakening that production invariant for
+    // a sub-second fixture.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
     let built = tokio::time::timeout(
         Duration::from_secs(20),
         bundler.run_due(&c.id, std::time::SystemTime::now()),

@@ -271,6 +271,38 @@ async fn admin_create_list_delete() -> TestResult {
         .send()
         .await?;
     assert_eq!(del_again.status(), 404);
+
+    // Repository IDs are reusable. A delete followed by recreate must not
+    // expose the old manifest/ref cache or make the first push disappear.
+    server.put_repo("t", "r").await?;
+    let replacement = TestRepo::synthetic(1, 1)?;
+    git_in(
+        &replacement,
+        &["commit", "--allow-empty", "-m", "recreated"],
+    )?;
+    git_in(
+        &replacement,
+        &["push", &server.repo_url("t", "r"), "HEAD:refs/heads/main"],
+    )?;
+    let clone_dir = tempfile::tempdir()?;
+    let clone = clone_dir.path().join("recreated");
+    let out = Command::new("git")
+        .args([
+            "clone",
+            "-q",
+            &server.repo_url("t", "r"),
+            clone.to_str().unwrap(),
+        ])
+        .output()?;
+    assert!(
+        out.status.success(),
+        "clone after recreate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        git_in(&clone, &["log", "-1", "--pretty=%s"])?.trim(),
+        "recreated"
+    );
     Ok(())
 }
 

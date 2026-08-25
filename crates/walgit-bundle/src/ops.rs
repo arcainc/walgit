@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use prost::Message;
 use sha1::{Digest, Sha1};
@@ -494,114 +494,10 @@ where
 // Leasing
 // ---------------------------------------------------------------------------
 
-/// A held bundle-build lease. Drop is best-effort release; call [`release`]
-/// for an awaited release.
-pub struct LeaseGuard {
-    store: Prefixed,
-    key: String,
-    purpose: String,
-    version: Version,
-    epoch: u64,
-    released: bool,
-}
-
-fn released_lease(purpose: &str, epoch: u64) -> Lease {
-    Lease {
-        holder: String::new(),
-        purpose: purpose.to_string(),
-        acquired_at: None,
-        expires_at: Some(time::from_system(UNIX_EPOCH)),
-        epoch,
-    }
-}
-
-async fn release_lease(
-    store: &Prefixed,
-    key: &str,
-    purpose: &str,
-    version: Version,
-    epoch: u64,
-) -> Result<(), BundleError> {
-    match store
-        .put(
-            key,
-            PutBody::from(released_lease(purpose, epoch).encode_to_vec()),
-            PutOptions::from(PutMode::Update(version)),
-        )
-        .await
-    {
-        Ok(_) | Err(StoreError::PreconditionFailed { .. }) | Err(StoreError::NotFound { .. }) => {
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-impl Drop for LeaseGuard {
-    /// Best-effort release when the holder is dropped without `release()`
-    /// (task cancelled by an instance shutdown): the next maintainer must not
-    /// wait a TTL for a lease nobody holds.
-    fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        let store = self.store.clone();
-        let key = self.key.clone();
-        let purpose = self.purpose.clone();
-        let version = self.version.clone();
-        let epoch = self.epoch;
-        if let Ok(h) = tokio::runtime::Handle::try_current() {
-            h.spawn(async move {
-                let _ = release_lease(&store, &key, &purpose, version, epoch).await;
-            });
-        }
-    }
-}
-
-impl LeaseGuard {
-    /// Release the lease with a CAS tombstone. Lease keys are reusable, so a
-    /// S3-style HEAD + DELETE must never be used here.
-    pub async fn release(mut self) -> Result<(), BundleError> {
-        self.released = true;
-        release_lease(
-            &self.store,
-            &self.key,
-            &self.purpose,
-            self.version.clone(),
-            self.epoch,
-        )
-        .await
-    }
-
-    /// CAS-extend the lease's expires_at (heartbeat).
-    pub async fn heartbeat(&mut self, ttl: Duration) -> Result<(), BundleError> {
-        let now = SystemTime::now();
-        let expires = now + ttl;
-        self.epoch += 1;
-        let lease = Lease {
-            holder: instance_id().to_string(),
-            purpose: self.purpose.clone(),
-            acquired_at: Some(time::from_system(now)),
-            expires_at: Some(time::from_system(expires)),
-            epoch: self.epoch,
-        };
-        match self
-            .store
-            .put(
-                &self.key,
-                PutBody::from(lease.encode_to_vec()),
-                PutOptions::from(PutMode::Update(self.version.clone())),
-            )
-            .await
-        {
-            Ok(meta) => {
-                self.version = meta.version;
-                Ok(())
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-}
+/// Bundle maintenance uses the shared fenced lease protocol. Keeping one
+/// implementation is intentional: S3-safe release and epoch fencing must
+/// cover every caller that can acquire a coordination key.
+pub type LeaseGuard = walgit_store::coord::LeaseGuard;
 
 /// Try to acquire a lease at `leases/bundle-<strategy>.pb`.
 ///
@@ -612,98 +508,17 @@ pub async fn try_acquire_lease(
     strategy: &str,
     ttl: Duration,
 ) -> Result<Option<LeaseGuard>, BundleError> {
-    let key = format!("{}bundle-{strategy}.pb", keys::LEASES_DIR);
-    let now = SystemTime::now();
-    let expires = now + ttl;
-    let lease = Lease {
-        holder: instance_id().to_string(),
-        purpose: format!("bundle-{strategy}"),
-        acquired_at: Some(time::from_system(now)),
-        expires_at: Some(time::from_system(expires)),
-        epoch: 0,
-    };
-    let body = lease.encode_to_vec();
-
-    // Try create-if-absent.
-    match store
-        .put(
-            &key,
-            PutBody::from(body.clone()),
-            PutOptions::from(PutMode::Create),
-        )
-        .await
-    {
-        Ok(meta) => {
-            return Ok(Some(LeaseGuard {
-                store: store.clone(),
-                key,
-                purpose: format!("bundle-{}", strategy),
-                version: meta.version,
-                epoch: 0,
-                released: false,
-            }));
-        }
-        Err(StoreError::PreconditionFailed { .. }) => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    // Already exists — check if expired and try to steal.
-    match store.get_bytes(&key).await? {
-        Some((meta, data)) => {
-            let existing = Lease::decode(data.as_ref())?;
-            let expired = existing
-                .expires_at
-                .as_ref()
-                .map(|t| time::to_system(t) <= now)
-                .unwrap_or(true);
-            if !expired {
-                return Ok(None);
-            }
-            let epoch = existing.epoch + 1;
-            let body = Lease {
-                holder: instance_id().to_string(),
-                purpose: format!("bundle-{strategy}"),
-                acquired_at: Some(time::from_system(now)),
-                expires_at: Some(time::from_system(now + ttl)),
-                epoch,
-            }
-            .encode_to_vec();
-            match store
-                .put(
-                    &key,
-                    PutBody::from(body),
-                    PutOptions::from(PutMode::Update(meta.version.clone())),
-                )
-                .await
-            {
-                Ok(new_meta) => Ok(Some(LeaseGuard {
-                    store: store.clone(),
-                    key,
-                    purpose: format!("bundle-{}", strategy),
-                    version: new_meta.version,
-                    epoch,
-                    released: false,
-                })),
-                Err(StoreError::PreconditionFailed { .. }) => Ok(None),
-                Err(e) => Err(e.into()),
-            }
-        }
-        None => match store
-            .put(&key, PutBody::from(body), PutOptions::from(PutMode::Create))
-            .await
-        {
-            Ok(meta) => Ok(Some(LeaseGuard {
-                store: store.clone(),
-                key,
-                purpose: format!("bundle-{}", strategy),
-                version: meta.version,
-                epoch: 0,
-                released: false,
-            })),
-            Err(StoreError::PreconditionFailed { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        },
-    }
+    let relative_key = format!("{}bundle-{strategy}.pb", keys::LEASES_DIR);
+    let key = format!("{}{}", store.prefix(), relative_key);
+    walgit_store::coord::try_acquire(
+        store.inner().clone(),
+        &key,
+        instance_id(),
+        &format!("bundle-{strategy}"),
+        ttl,
+    )
+    .await
+    .map_err(|e| BundleError::Other(e.to_string()))
 }
 
 /// Manually hold a lease for a strategy (prevents builds). Used in tests
