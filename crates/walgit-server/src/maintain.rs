@@ -700,20 +700,21 @@ pub async fn heartbeats(
     let mut keys = state.store.list(walgit_proto::keys::MAINTAIN_DIR, None);
     while let Some(m) = keys.next().await {
         let m = m?;
-        if let Some((meta, bytes)) = state.store.get_bytes(&m.key).await? {
+        if let Some((_meta, bytes)) = state.store.get_bytes(&m.key).await? {
             if let Ok(hb) = walgit_proto::v1::MaintainerHeartbeat::decode(bytes.as_ref()) {
-                // A host that has not passed for a day is gone: purge its
-                // heartbeat so the plan shows only live maintainers.
+                // A host that has not passed for a day is gone. Do not
+                // conditionally delete this reusable host key: S3 emulates
+                // conditional DELETE as HEAD + DELETE, so an old maintainer
+                // could delete a newer process's heartbeat after the key was
+                // overwritten. Stale rows are harmless and are filtered out
+                // by age below.
                 let age = hb
                     .last_pass_at
                     .as_ref()
                     .map(walgit_proto::time::to_system)
                     .and_then(|t| SystemTime::now().duration_since(t).ok());
                 if age.is_some_and(|a| a > HEARTBEAT_EXPIRY) {
-                    if state.cfg.has_role(walgit_config::Role::Maintain) {
-                        info!(host = %hb.host, age_secs = age.map(|a| a.as_secs()).unwrap_or(0), "maintenance: purging expired heartbeat");
-                        let _ = state.store.delete(&m.key, Some(meta.version)).await;
-                    }
+                    info!(host = %hb.host, age_secs = age.map(|a| a.as_secs()).unwrap_or(0), "maintenance: ignoring expired heartbeat");
                     continue;
                 }
                 out.push(hb);
