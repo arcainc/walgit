@@ -16,7 +16,7 @@
 //! half-written pack never looks final; the marker's phase is whatever completed.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use walgit_config::Config;
@@ -170,6 +170,8 @@ pub async fn rebuild_base(
     handle: &RepoHandle,
     cfg: &Config,
     log: Log<'_>,
+    lease: &mut walgit_store::coord::LeaseGuard,
+    lease_ttl: Duration,
 ) -> anyhow::Result<RebuildOutcome> {
     let id = handle.id().clone();
     let root = scratch_root(cfg);
@@ -339,6 +341,7 @@ pub async fn rebuild_base(
     let mut supersedes_left = Some(supersedes);
     let mut published = Vec::new();
     for c in &to_install {
+        ensure_lease_before_publish(lease, lease_ttl).await?;
         let hex = c.to_hex().to_string();
         let Some(info) = local_packs.iter().find(|p| &p.checksum == c).cloned() else {
             bail!("pack {hex} not visible in the serving copy after install");
@@ -377,6 +380,17 @@ pub async fn rebuild_base(
         superseded,
         resumed,
     })
+}
+
+async fn ensure_lease_before_publish(
+    lease: &mut walgit_store::coord::LeaseGuard,
+    ttl: Duration,
+) -> anyhow::Result<()> {
+    if lease.renew_if_needed(ttl).await? {
+        Ok(())
+    } else {
+        bail!("compaction lease lost before base publish")
+    }
 }
 
 fn start_scratch(

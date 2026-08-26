@@ -51,8 +51,11 @@ pub struct FaultPlan {
     /// Latency added AFTER the inner op: the operation has taken effect (or
     /// captured its read result) but the response arrives late. This models a
     /// slow network delivering an already-stale snapshot or a delayed write
-    /// acknowledgement. Honours `only_keys`.
+    /// acknowledgement. Honours `only_keys` and, when set, `delay_after_ops`.
     pub delay_after: Option<Duration>,
+    /// Restrict `delay_after` to operation names (`get`, `head`, `put`,
+    /// `delete`, `compose`, `list`, `list_prefixes`). `None` means every op.
+    pub delay_after_ops: Option<Vec<String>>,
     /// `Retryable` before the op is applied (get/head/put/delete/list/compose).
     pub p_err_before: f64,
     /// Mutation applied, then `Retryable` returned (put/delete/compose only).
@@ -360,7 +363,14 @@ impl FaultStore {
 
     async fn delay_after(&self, op: &str, key: &str) {
         let plan = self.plan();
-        if let Some(d) = plan.delay_after.filter(|_| Self::in_scope(&plan, key)) {
+        let op_in_scope = plan
+            .delay_after_ops
+            .as_ref()
+            .is_none_or(|ops| ops.iter().any(|candidate| candidate == op));
+        if let Some(d) = plan
+            .delay_after
+            .filter(|_| op_in_scope && Self::in_scope(&plan, key))
+        {
             self.log(format!(
                 "{} {op} {key}: response delivered {d:?} late",
                 self.name
@@ -488,7 +498,14 @@ impl ObjectStore for FaultStore {
             return Box::pin(futures::stream::once(async move { Err(e) }));
         }
         let inner = self.inner.list(prefix, start_after);
-        let Some(d) = plan.delay_after.filter(|_| Self::in_scope(&plan, prefix)) else {
+        let op_in_scope = plan
+            .delay_after_ops
+            .as_ref()
+            .is_none_or(|ops| ops.iter().any(|candidate| candidate == "list"));
+        let Some(d) = plan
+            .delay_after
+            .filter(|_| op_in_scope && Self::in_scope(&plan, prefix))
+        else {
             return inner;
         };
         self.log(format!(
