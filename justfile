@@ -31,35 +31,50 @@ dev-local config="walgit.standalone.toml":
     echo "→ https://walgit.localhost:${port}/  (PORT=${port}, config {{config}}, store rustfs :9000, cache /tmp/walgit)"
     exec ./target/release/walgit-server --config {{config}}
 
-# Start rustfs (S3-compatible) for local dev via podman compose (rootless, no daemon group needed;
-# `podman compose` drives compose.yaml through the docker-compose binary dev.yml installs).
-# `podman compose` talks to the podman API socket; rootless nix podman has no systemd unit for it, so
-# `podman system service` is started (detached, idle-timeout 0) when the socket is missing.
+# Start rustfs (S3-compatible) for local dev. Prefer a healthy Podman Compose
+# connection, then fall back to Docker Compose (Colima/Docker Desktop).
 dev-store:
     #!/usr/bin/env bash
     set -euo pipefail
-    # nix podman ships no /etc/containers: give the user a signature policy + registry search list once.
-    cdir="${XDG_CONFIG_HOME:-$HOME/.config}/containers"; mkdir -p "$cdir"
-    [ -f "$cdir/policy.json" ] || printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' > "$cdir/policy.json"
-    [ -f "$cdir/registries.conf" ] || printf 'unqualified-search-registries = ["docker.io"]\n' > "$cdir/registries.conf"
-    sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
-    if [ ! -S "$sock" ]; then
-        echo "starting rootless podman API socket at $sock"
-        mkdir -p "$(dirname "$sock")"
-        setsid nohup podman system service --time=0 "unix://$sock" >/tmp/walgit-podman-service.log 2>&1 < /dev/null &
-        for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
-        [ -S "$sock" ] || { echo "podman API socket did not appear; see /tmp/walgit-podman-service.log"; exit 1; }
+    compose=()
+    if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
+        # nix podman ships no /etc/containers: give the user a signature policy + registry search list once.
+        cdir="${XDG_CONFIG_HOME:-$HOME/.config}/containers"; mkdir -p "$cdir"
+        [ -f "$cdir/policy.json" ] || printf '{"default":[{"type":"insecureAcceptAnything"}]}\n' > "$cdir/policy.json"
+        [ -f "$cdir/registries.conf" ] || printf 'unqualified-search-registries = ["docker.io"]\n' > "$cdir/registries.conf"
+        compose=(podman compose)
+    elif command -v docker-compose >/dev/null 2>&1; then
+        compose=(docker-compose)
+    elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        compose=(docker compose)
+    else
+        echo "no healthy Podman or Docker Compose backend found" >&2
+        exit 1
     fi
-    podman compose up -d rustfs
+    echo "using compose backend: ${compose[*]}"
+    "${compose[@]}" up -d rustfs
     echo "Waiting for rustfs to be healthy..."
-    podman compose run --rm create-bucket
+    "${compose[@]}" run --rm create-bucket
     echo "rustfs is running on http://127.0.0.1:9000 (console :9001)"
     echo "Credentials: walgit-dev / walgit-dev-secret"
     echo "Bucket: walgit-test"
 
 # Stop rustfs.
 dev-store-stop:
-    podman compose down
+    #!/usr/bin/env bash
+    set -euo pipefail
+    compose=()
+    if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
+        compose=(podman compose)
+    elif command -v docker-compose >/dev/null 2>&1; then
+        compose=(docker-compose)
+    elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        compose=(docker compose)
+    else
+        echo "no healthy Podman or Docker Compose backend found" >&2
+        exit 1
+    fi
+    "${compose[@]}" down
 
 # --- tests -------------------------------------------------------------------
 # Tiers (all hermetic: in-memory store, tempdir caches, real `git` binary):

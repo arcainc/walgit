@@ -1,0 +1,58 @@
+name: Rust correctness
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-correctness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  correctness:
+    name: Hermetic and RustFS checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Store unit tests
+        run: cargo test -p walgit-store --lib
+
+      - name: Bundle correctness tests
+        run: cargo test -p walgit-bundle --test bundle -- --nocapture
+
+      - name: Multi-client simulation
+        env:
+          WALGIT_SIM_SEEDS: "2"
+        run: cargo test -p walgit-server --test sim -- --nocapture
+
+      - name: Start RustFS
+        run: docker compose up -d rustfs
+
+      - name: Create test bucket
+        run: docker compose run --rm create-bucket
+
+      - name: S3 contract and fencing tests
+        env:
+          WALGIT_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          WALGIT_TEST_BUCKET: walgit-test
+          AWS_ACCESS_KEY_ID: walgit-dev
+          AWS_SECRET_ACCESS_KEY: walgit-dev-secret
+        run: cargo test -p walgit-store --test contract -- --nocapture

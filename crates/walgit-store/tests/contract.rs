@@ -12,6 +12,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -718,6 +719,101 @@ async fn s3_contract() {
     for m in to_delete {
         let _ = store.delete(&m.key, None).await;
     }
+}
+
+/// A delayed create acknowledgement must not let an old owner release a
+/// successor's lease. This uses the actual S3 conditional PUT path rather
+/// than MemoryStore's in-process CAS implementation.
+#[cfg(feature = "s3")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_delayed_lease_reclamation_fences_stale_owner() {
+    let endpoint = match std::env::var("WALGIT_TEST_S3_ENDPOINT") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "skipping s3_delayed_lease_reclamation_fences_stale_owner: WALGIT_TEST_S3_ENDPOINT not set"
+            );
+            return;
+        }
+    };
+    let bucket = std::env::var("WALGIT_TEST_BUCKET").unwrap_or_else(|_| "walgit-test".into());
+    let prefix = format!("lease-stress-{}/", uuid::Uuid::new_v4().simple());
+    let cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::S3,
+        bucket,
+        prefix: String::new(),
+        s3: walgit_config::S3Config {
+            endpoint,
+            region: "us-east-1".into(),
+            access_key_env: "AWS_ACCESS_KEY_ID".into(),
+            secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
+            force_path_style: true,
+        },
+        multipart_threshold: bytesize::ByteSize::mib(5),
+        multipart_part_size: bytesize::ByteSize::mib(5),
+        ..Default::default()
+    };
+    let truth: DynStore = Arc::new(
+        walgit_store::s3::S3Store::new(&cfg)
+            .await
+            .expect("S3Store::new"),
+    );
+    let key = format!("{prefix}leases/bundle.pb");
+    let ttl = Duration::from_millis(50);
+    let old = walgit_store::fault::FaultStore::new(truth.clone(), "old", 1);
+    old.set(walgit_store::fault::FaultPlan {
+        delay_after: Some(Duration::from_millis(2_500)),
+        delay_after_ops: Some(vec!["put".into()]),
+        only_keys: Some(vec![key.clone()]),
+        ..Default::default()
+    });
+    let old_key = key.clone();
+    let old_link = old.clone();
+    let old_task = tokio::spawn(async move {
+        walgit_store::coord::try_acquire(
+            old_link as DynStore,
+            &old_key,
+            "old-owner",
+            "bundle-stress",
+            ttl,
+        )
+        .await
+    });
+
+    // The S3 mutation is visible before its response is released.
+    for _ in 0..100 {
+        if truth.head(&key).await.expect("head lease").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+    let successor =
+        walgit_store::coord::try_acquire(truth.clone(), &key, "new-owner", "bundle-stress", ttl)
+            .await
+            .expect("successor acquire")
+            .expect("successor should reclaim the expired lease");
+    let old_guard = tokio::time::timeout(Duration::from_secs(5), old_task)
+        .await
+        .expect("old delayed acknowledgement timed out")
+        .expect("old acquire task panicked")
+        .expect("old lease create failed")
+        .expect("old lease was not acquired");
+    old.heal();
+    old_guard
+        .release()
+        .await
+        .expect("stale release is harmless");
+
+    let (_, current) =
+        walgit_store::coord::get_message::<walgit_proto::v1::Lease>(truth.as_ref(), &key)
+            .await
+            .expect("read successor lease")
+            .expect("successor lease should remain");
+    assert_eq!(current.holder, "new-owner");
+    successor.release().await.expect("successor release");
+    let _ = truth.delete(&key, None).await;
 }
 
 #[cfg(feature = "gcs")]
