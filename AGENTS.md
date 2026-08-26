@@ -137,8 +137,8 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `log/<first_seq>.pb` | Immutable, uvarint-framed `LogEntry` frames: PUSH / REF_UPDATE (ref transaction + pack pointer), COMPACT (new pack, `supersedes[]`), CHECKPOINT, SETTINGS. Strictly increasing `seq`. One small object per publish batch. |
 | `wal/<checksum>.pack/.idx/.rev/.bitmap/.commit-graph` | Immutable packs, content-addressed by pack checksum: push packs (tier 0), compaction outputs (tier 1), the base (tier 2, bitmap'd), plus the side-files a reader needs. |
 | `checkpoints/<seq>/checkpoint.pb`, `refs.pb` | Folded state at `seq`: live pack set + full `RefSnapshot`. Cold start = snapshot + tail, never full replay. |
-| `bundles/list.pb`, `bundles/<strategy>/…` | bundle-uri artefacts + CAS'd list. |
-| `leases/<name>.pb` | CAS lease with TTL heartbeat: `compact`, `bundle:<strategy>`. The only cross-instance mutex. |
+| `bundles/list.pb`, `bundles/<strategy>/…` | bundle-uri artefacts + CAS'd list. List mutations use the shared `leases/bundle-list.pb` fence plus the strategy fence; the coordination fields are ignored by git clients. |
+| `leases/<name>.pb` | CAS lease with TTL heartbeat: `compact`, `bundle:<strategy>`, and the short-lived `bundle-list` writer lease. The only cross-instance mutexes. |
 | `cache/api/v1/<sha1>.json` | Shared render cache of immutable web API answers. |
 | `policy.json` | Per-repo push policy (rule language, not on the WAL). `docs/POLICY.md`. Missing = allow-all. |
 | `fsck.pb` | Last connectivity audit (`FsckReport`), written by the maintainer's `fsck` unit, consumed by `repair` (`docs/INTEGRITY.md`). |
@@ -225,7 +225,8 @@ changes take effect by re-planning; there are no one-off backfill scripts.
   natively, S3 by multipart `UploadPartCopy`; no disk, no index-pack), **daily incremental** chained on the previous
   daily, **hourly incremental** on the newest daily, each on a calendar slot (6-field UTC cron `schedule`; the fire
   time is the as-of instant), `creationToken = slot epoch`, main-only refs for `bundles.main_only` repos;
-  `bundles/list.pb` CAS'd.
+  `bundles/list.pb` CAS'd. Every writer fences the list before its CAS; strategy publishers also carry the
+  per-strategy acquisition token, so an owner that loses its lease cannot overwrite a successor's list.
 - Served as static objects (`/{o}/{r}.git/bundles/...`, ETag/Range, immutable) by walgit or offloaded to an edge
   (`X-Accel-Redirect`, `deploy/nginx.conf.example`), or as presigned store URLs (`serve_via = "signed_url"`);
   advertised in the v2 capability list, at `bundles/list` and on band 2 of every narrated fetch. `bundles.require`

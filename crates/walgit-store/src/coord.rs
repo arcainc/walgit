@@ -201,6 +201,10 @@ pub struct LeaseGuard {
     version: Version,
     expires_at: SystemTime,
     epoch: u64,
+    /// Stable fencing token for this lease acquisition. Heartbeats advance
+    /// the lease's liveness epoch, but must not change the token a downstream
+    /// writer uses to fence stale work from this owner.
+    fence_token: u64,
     /// Set by `release` / `Drop` so the other path is a no-op. Also read by the
     /// heartbeat task to know when to stop.
     released: AtomicBool,
@@ -225,6 +229,7 @@ impl LeaseGuard {
             version,
             expires_at: now + ttl,
             epoch,
+            fence_token: epoch,
             released: AtomicBool::new(false),
         }
     }
@@ -324,6 +329,12 @@ impl LeaseGuard {
 
     pub fn expires_at(&self) -> SystemTime {
         self.expires_at
+    }
+
+    /// Stable token identifying this lease acquisition. It increases only
+    /// when a successor takes over the lease, not on heartbeat renewals.
+    pub fn fencing_token(&self) -> u64 {
+        self.fence_token
     }
 }
 
@@ -757,6 +768,20 @@ mod tests {
         }
         handle.await.unwrap();
         let guard = Arc::try_unwrap(g).ok().expect("single ref").into_inner();
+        guard.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fencing_token_is_stable_across_heartbeats() {
+        let store = dyn_store();
+        let key = "leases/fence-token.pb";
+        let mut guard = try_acquire(store, key, "h1", "test", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        let token = guard.fencing_token();
+        guard.heartbeat(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(guard.fencing_token(), token);
         guard.release().await.unwrap();
     }
 

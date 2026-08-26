@@ -22,7 +22,10 @@ use tokio::sync::Notify;
 use walgit_bundle::{BundleError, BundleRepoHandle, BundleSource, Bundler, RepoId, ops};
 use walgit_config::{BundleKind, BundleServe, BundleStrategy, BundlesConfig, Config};
 use walgit_git::{LocalRepo, ObjectFormat as GitObjectFormat};
-use walgit_store::{DynStore, ObjectStore, ObjectStoreExt, Prefixed, memory::MemoryStore};
+use walgit_store::{
+    BoxStream, DynStore, GetOptions, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, Prefixed,
+    PutBody, PutMode, PutOptions, Result as StoreResult, Version, memory::MemoryStore,
+};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -155,6 +158,84 @@ impl BundleSource for BlockingSource {
 
     async fn list_repos(&self) -> Result<Vec<RepoId>, BundleError> {
         Ok(Vec::new())
+    }
+}
+
+/// Pauses one list CAS before the inner store applies it. This is the
+/// interleaving a response-delay fault cannot model: the stale writer has a
+/// real read/version, but the successor takes over before the conditional put
+/// executes.
+struct BlockingListPutStore {
+    inner: DynStore,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    put_count: AtomicU64,
+    block_on_put: AtomicU64,
+}
+
+impl BlockingListPutStore {
+    fn new(inner: DynStore, entered: Arc<Notify>, release: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            entered,
+            release,
+            put_count: AtomicU64::new(0),
+            block_on_put: AtomicU64::new(0),
+        })
+    }
+
+    fn block_next_final_list_put(&self) {
+        // A fenced CAS performs one metadata put before the logical list put
+        // when a new shared-list token is acquired. Block the latter. Lease
+        // acquire/release writes are counted too, hence the three-write gap.
+        let target = self.put_count.load(Ordering::SeqCst) + 3;
+        self.block_on_put.store(target, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for BlockingListPutStore {
+    fn backend(&self) -> &'static str {
+        "blocking-list-put"
+    }
+
+    async fn get(&self, key: &str, opts: GetOptions) -> StoreResult<GetResult> {
+        self.inner.get(key, opts).await
+    }
+
+    async fn head(&self, key: &str) -> StoreResult<Option<ObjectMeta>> {
+        self.inner.head(key).await
+    }
+
+    async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> StoreResult<ObjectMeta> {
+        let put_number = self.put_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let should_block = key.ends_with("bundles/list.pb")
+            && matches!(&opts.mode, PutMode::Update(_))
+            && self
+                .block_on_put
+                .compare_exchange(put_number, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+        if should_block {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.put(key, body, opts).await
+    }
+
+    async fn delete(&self, key: &str, if_version: Option<Version>) -> StoreResult<()> {
+        self.inner.delete(key, if_version).await
+    }
+
+    fn list(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+        self.inner.list(prefix, start_after)
+    }
+
+    async fn list_prefixes(&self, prefix: &str) -> StoreResult<Vec<String>> {
+        self.inner.list_prefixes(prefix).await
     }
 }
 
@@ -654,10 +735,153 @@ async fn stale_bundle_owner_cannot_publish_after_lease_reclaimed() {
         matches!(result, Err(BundleError::LeaseLost)),
         "stale owner must stop before publishing, got {result:?}"
     );
+    let list = ops::read_list(&tr.store)
+        .await
+        .unwrap()
+        .expect("successor fencing should leave list metadata");
     assert!(
-        ops::read_list(&tr.store).await.unwrap().is_none(),
-        "stale owner published a bundle list after lease takeover"
+        list.bundles.is_empty(),
+        "stale owner published a bundle after lease takeover: {list:?}"
     );
+}
+
+#[tokio::test]
+async fn strategy_lease_fences_bundle_list_before_guard_is_returned() {
+    let tr = TestRepo::new("test", "fence-metadata").await;
+    let ttl = Duration::from_secs(30);
+
+    let first = ops::try_acquire_lease(&tr.store, "weekly", ttl)
+        .await
+        .unwrap()
+        .expect("first strategy owner should acquire");
+    let first_token = first.fencing_token();
+    let first_list = ops::read_list(&tr.store)
+        .await
+        .unwrap()
+        .expect("lease acquisition writes the list fence");
+    assert_eq!(
+        first_list
+            .lease_fences
+            .iter()
+            .find(|fence| fence.strategy == "weekly")
+            .map(|fence| fence.epoch),
+        Some(first_token),
+        "a strategy guard must not escape before its list fence is durable"
+    );
+    let first_list_token = first_list.list_lease_epoch;
+    first.release().await.unwrap();
+
+    // The list lease has its own epoch domain: acquiring a different strategy
+    // must still advance the global token even though that strategy's first
+    // fencing token is zero.
+    let daily = ops::try_acquire_lease(&tr.store, "daily", ttl)
+        .await
+        .unwrap()
+        .expect("different strategy should acquire independently");
+    let daily_list = ops::read_list(&tr.store)
+        .await
+        .unwrap()
+        .expect("different strategy acquisition keeps the list fence");
+    assert!(daily_list.list_lease_epoch > first_list_token);
+    assert_eq!(daily.fencing_token(), first_token);
+    assert_eq!(
+        daily_list
+            .lease_fences
+            .iter()
+            .find(|fence| fence.strategy == "weekly")
+            .map(|fence| fence.epoch),
+        Some(first_token)
+    );
+    daily.release().await.unwrap();
+
+    let second = ops::try_acquire_lease(&tr.store, "weekly", ttl)
+        .await
+        .unwrap()
+        .expect("released strategy lease should be reusable");
+    assert!(second.fencing_token() > first_token);
+    let second_list = ops::read_list(&tr.store)
+        .await
+        .unwrap()
+        .expect("successor acquisition keeps the list fence");
+    assert!(second_list.list_lease_epoch > daily_list.list_lease_epoch);
+    assert_eq!(
+        second_list
+            .lease_fences
+            .iter()
+            .find(|fence| fence.strategy == "weekly")
+            .map(|fence| fence.epoch),
+        Some(second.fencing_token())
+    );
+    second.release().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_stale_list_cas_cannot_publish_after_strategy_takeover() {
+    let truth = MemoryStore::shared() as DynStore;
+    let prefix = "repos/test/delayed-fence/";
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let old_link = BlockingListPutStore::new(truth.clone(), entered.clone(), release.clone());
+    let old_store = Prefixed::new(old_link.clone() as DynStore, prefix);
+    let successor_store = Prefixed::new(truth, prefix);
+    let ttl = Duration::from_millis(50);
+
+    let old = ops::try_acquire_lease(&old_store, "weekly", ttl)
+        .await
+        .unwrap()
+        .expect("old owner should acquire");
+    old_link.block_next_final_list_put();
+    let old_task = tokio::spawn(async move {
+        let mut old = old;
+        ops::cas_update_list_fenced(&old_store, 8, "weekly", &mut old, ttl, |current| {
+            let mut list = current.cloned().unwrap_or_default();
+            list.bundles.push(walgit_proto::v1::BundleEntry {
+                id: "stale".into(),
+                key: "bundles/weekly/stale.bundle".into(),
+                strategy: "weekly".into(),
+                kind: "full".into(),
+                creation_token: 1,
+                ..Default::default()
+            });
+            Ok(Some(list))
+        })
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("old writer never reached the delayed final list CAS");
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let successor = ops::try_acquire_lease(&successor_store, "weekly", ttl)
+        .await
+        .unwrap()
+        .expect("successor should reclaim the expired strategy lease");
+    release.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), old_task)
+        .await
+        .expect("stale writer hung")
+        .expect("stale writer task panicked");
+    assert!(
+        matches!(result, Err(BundleError::LeaseLost)),
+        "stale final CAS must be fenced, got {result:?}"
+    );
+    let list = ops::read_list(&successor_store)
+        .await
+        .unwrap()
+        .expect("successor fencing leaves list metadata");
+    assert!(
+        list.bundles.iter().all(|entry| entry.id != "stale"),
+        "stale writer published after takeover: {list:?}"
+    );
+    assert_eq!(
+        list.lease_fences
+            .iter()
+            .find(|fence| fence.strategy == "weekly")
+            .map(|fence| fence.epoch),
+        Some(successor.fencing_token())
+    );
+    successor.release().await.unwrap();
 }
 
 #[tokio::test]

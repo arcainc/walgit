@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 
 use walgit_config::BundleKind;
 use walgit_git::{GitError, LocalRepo, RefSnapshotData};
-use walgit_proto::v1::{BundleEntry, BundleList, Lease, Ref};
+use walgit_proto::v1::{BundleEntry, BundleLeaseFence, BundleList, Lease, Ref};
 use walgit_proto::{keys, time};
 use walgit_store::{
     ObjectStore, ObjectStoreExt, Prefixed, PutBody, PutMode, PutOptions, StoreError, Version,
@@ -383,6 +383,36 @@ pub async fn record_skipped(
     .await
 }
 
+/// Record a verdict while the caller still owns the strategy lease. This is
+/// used by a build that decides not to cut a closed slot; a stale owner must
+/// not be able to mark a slot after a successor has taken over.
+pub async fn record_skipped_fenced(
+    store: &Prefixed,
+    strategy: &str,
+    slot: u64,
+    base_id: &str,
+    as_of_seq: u64,
+    reason: &str,
+    strategy_lease: &mut LeaseGuard,
+    lease_ttl: Duration,
+) -> Result<(), BundleError> {
+    record_skipped_many_fenced(
+        store,
+        strategy,
+        vec![walgit_proto::v1::SkippedSlot {
+            strategy: strategy.to_string(),
+            slot,
+            base_id: base_id.to_string(),
+            as_of_seq,
+            reason: reason.to_string(),
+            at: Some(time::now()),
+        }],
+        strategy_lease,
+        lease_ttl,
+    )
+    .await
+}
+
 /// Upper bound on recorded verdicts: the plan only looks at slots inside the retention window
 /// (≤ 1 weekly period of dailies, ≤ 1 daily period of hourlies, per family), so anything older is
 /// irrelevant; the newest verdicts (by slot) are the ones kept.
@@ -427,25 +457,156 @@ pub async fn record_skipped_many(
     Ok(())
 }
 
-/// CAS read-modify-write loop on `bundles/list.pb`.
+pub async fn record_skipped_many_fenced(
+    store: &Prefixed,
+    strategy: &str,
+    verdicts: Vec<walgit_proto::v1::SkippedSlot>,
+    strategy_lease: &mut LeaseGuard,
+    lease_ttl: Duration,
+) -> Result<(), BundleError> {
+    if verdicts.is_empty() {
+        return Ok(());
+    }
+    let _ = cas_update_list_fenced(store, 8, strategy, strategy_lease, lease_ttl, move |cur| {
+        let mut next = cur.cloned().unwrap_or_default();
+        let mut added = false;
+        for v in &verdicts {
+            if next
+                .skipped
+                .iter()
+                .any(|k| k.strategy == v.strategy && k.slot == v.slot && k.base_id == v.base_id)
+            {
+                continue;
+            }
+            next.skipped.push(v.clone());
+            added = true;
+        }
+        if !added {
+            return Ok(None);
+        }
+        if next.skipped.len() > SKIPPED_KEPT {
+            next.skipped.sort_by_key(|k| k.slot);
+            let drop = next.skipped.len() - SKIPPED_KEPT;
+            next.skipped.drain(0..drop);
+        }
+        next.updated_at = Some(time::now());
+        Ok(Some(next))
+    })
+    .await?;
+    Ok(())
+}
+
+/// Default TTL for the short-lived shared lease that fences every bundle-list
+/// mutation. Build work still holds its per-strategy lease; this lease only
+/// serializes and fences the final list commit. Keep it short so a crashed
+/// list writer cannot stall maintenance for the strategy lease's 30-minute
+/// work window.
+pub const BUNDLE_LIST_LEASE_TTL: Duration = Duration::from_secs(30);
+const BUNDLE_LIST_LEASE_WAIT: Duration = Duration::from_secs(2);
+
+/// CAS read-modify-write loop on `bundles/list.pb` using the shared list lease.
 ///
+/// The public convenience form acquires the list lease itself. Strategy build
+/// callers must use [`cas_update_list_fenced`] so a stale strategy owner cannot
+/// reacquire the shared lease and publish after its work lease was taken over.
 /// `f` receives `None` when the list is absent, `Some(&list)` when present.
-/// Returning `None` from `f` aborts the update with `Ok(None)`.
+/// Returning `None` from `f` aborts the logical update with `Ok(None)`.
 pub async fn cas_update_list<F>(
     store: &Prefixed,
     max_retries: u32,
+    f: F,
+) -> Result<Option<(Version, BundleList)>, BundleError>
+where
+    F: FnMut(Option<&BundleList>) -> Result<Option<BundleList>, BundleError>,
+{
+    let mut lease = acquire_list_lease(store, BUNDLE_LIST_LEASE_TTL, BUNDLE_LIST_LEASE_WAIT, None)
+        .await?
+        .ok_or_else(|| BundleError::Other("bundle list lease held".into()))?;
+    let result = cas_update_list_with_lease(
+        store,
+        max_retries,
+        &mut lease,
+        BUNDLE_LIST_LEASE_TTL,
+        None,
+        f,
+    )
+    .await;
+    lease.release().await.ok();
+    result
+}
+
+/// Fenced list update for a writer that holds a per-strategy lease.
+///
+/// The strategy token is recorded in the list before the lease acquisition is
+/// exposed. A successor advances that token, so a stale writer's conditional
+/// list PUT either fails on the object version or observes the newer token and
+/// returns [`BundleError::LeaseLost`].
+pub async fn cas_update_list_fenced<F>(
+    store: &Prefixed,
+    max_retries: u32,
+    strategy: &str,
+    strategy_lease: &mut LeaseGuard,
+    lease_ttl: Duration,
+    f: F,
+) -> Result<Option<(Version, BundleList)>, BundleError>
+where
+    F: FnMut(Option<&BundleList>) -> Result<Option<BundleList>, BundleError>,
+{
+    ensure_lease(strategy_lease, lease_ttl).await?;
+    let list_lease_ttl = lease_ttl.min(BUNDLE_LIST_LEASE_TTL);
+    let mut list_lease = acquire_list_lease(
+        store,
+        list_lease_ttl,
+        BUNDLE_LIST_LEASE_WAIT,
+        Some((strategy, strategy_lease.fencing_token())),
+    )
+    .await?
+    .ok_or_else(|| BundleError::Other("bundle list lease held".into()))?;
+    let result = cas_update_list_with_lease(
+        store,
+        max_retries,
+        &mut list_lease,
+        list_lease_ttl,
+        Some((strategy, strategy_lease)),
+        f,
+    )
+    .await;
+    list_lease.release().await.ok();
+    result
+}
+
+async fn cas_update_list_with_lease<F>(
+    store: &Prefixed,
+    max_retries: u32,
+    list_lease: &mut LeaseGuard,
+    lease_ttl: Duration,
+    strategy_lease: Option<(&str, &mut LeaseGuard)>,
     mut f: F,
 ) -> Result<Option<(Version, BundleList)>, BundleError>
 where
     F: FnMut(Option<&BundleList>) -> Result<Option<BundleList>, BundleError>,
 {
+    let mut strategy_lease = strategy_lease;
+    let strategy = strategy_lease.as_ref().map(|(name, _)| *name);
+    let strategy_token = strategy_lease
+        .as_ref()
+        .map(|(_, lease)| lease.fencing_token());
     let key = keys::BUNDLE_LIST;
-    for attempt in 0..max_retries {
+    for attempt in 0..max_retries.max(1) {
+        ensure_lease(list_lease, lease_ttl).await?;
+        if let Some((_, lease)) = strategy_lease.as_mut() {
+            ensure_lease(lease, lease_ttl).await?;
+        }
         let current = store.get_bytes(key).await?;
         match current {
             None => match f(None)? {
                 None => return Ok(None),
-                Some(new_list) => {
+                Some(mut new_list) => {
+                    apply_fence_metadata(
+                        &mut new_list,
+                        list_lease.fencing_token(),
+                        strategy.zip(strategy_token),
+                    )?;
                     let body = new_list.encode_to_vec();
                     match store
                         .put(key, PutBody::from(body), PutOptions::from(PutMode::Create))
@@ -462,9 +623,19 @@ where
             },
             Some((meta, data)) => {
                 let list = BundleList::decode(data.as_ref())?;
+                validate_fence_metadata(
+                    &list,
+                    list_lease.fencing_token(),
+                    strategy.zip(strategy_token),
+                )?;
                 match f(Some(&list))? {
                     None => return Ok(None),
-                    Some(new_list) => {
+                    Some(mut new_list) => {
+                        apply_fence_metadata(
+                            &mut new_list,
+                            list_lease.fencing_token(),
+                            strategy.zip(strategy_token),
+                        )?;
                         let body = new_list.encode_to_vec();
                         match store
                             .put(
@@ -499,6 +670,143 @@ where
 /// cover every caller that can acquire a coordination key.
 pub type LeaseGuard = walgit_store::coord::LeaseGuard;
 
+async fn ensure_lease(lease: &mut LeaseGuard, ttl: Duration) -> Result<(), BundleError> {
+    match lease
+        .renew_if_needed(ttl)
+        .await
+        .map_err(|e| BundleError::Other(e.to_string()))?
+    {
+        true => Ok(()),
+        false => Err(BundleError::LeaseLost),
+    }
+}
+
+/// Acquire the shared short-lived lease that serializes bundle-list writes.
+/// The acquired fencing token is written into the list before the guard is
+/// returned; this is the hand-off point that makes stale final CASes fail.
+pub async fn try_acquire_list_lease(
+    store: &Prefixed,
+    ttl: Duration,
+) -> Result<Option<LeaseGuard>, BundleError> {
+    acquire_list_lease(store, ttl, Duration::ZERO, None).await
+}
+
+async fn acquire_list_lease(
+    store: &Prefixed,
+    ttl: Duration,
+    wait_up_to: Duration,
+    strategy: Option<(&str, u64)>,
+) -> Result<Option<LeaseGuard>, BundleError> {
+    let relative_key = keys::lease_key("bundle-list");
+    let key = format!("{}{}", store.prefix(), relative_key);
+    let lease = walgit_store::coord::acquire(
+        store.inner().clone(),
+        &key,
+        instance_id(),
+        "bundle-list",
+        ttl,
+        wait_up_to,
+    )
+    .await
+    .map_err(|e| BundleError::Other(e.to_string()))?;
+    let Some(mut lease) = lease else {
+        return Ok(None);
+    };
+    if let Err(error) = fence_bundle_list(store, &mut lease, ttl, strategy, 8).await {
+        let _ = lease.release().await;
+        return match error {
+            BundleError::LeaseLost => Ok(None),
+            other => Err(other),
+        };
+    }
+    Ok(Some(lease))
+}
+
+fn validate_fence_metadata(
+    list: &BundleList,
+    list_epoch: u64,
+    strategy: Option<(&str, u64)>,
+) -> Result<(), BundleError> {
+    if list.list_lease_epoch > list_epoch {
+        return Err(BundleError::LeaseLost);
+    }
+    if let Some((name, epoch)) = strategy {
+        if list
+            .lease_fences
+            .iter()
+            .filter(|fence| fence.strategy == name)
+            .any(|fence| fence.epoch > epoch)
+        {
+            return Err(BundleError::LeaseLost);
+        }
+    }
+    Ok(())
+}
+
+fn apply_fence_metadata(
+    list: &mut BundleList,
+    list_epoch: u64,
+    strategy: Option<(&str, u64)>,
+) -> Result<(), BundleError> {
+    validate_fence_metadata(list, list_epoch, strategy)?;
+    list.list_lease_epoch = list_epoch;
+    if let Some((name, epoch)) = strategy {
+        // Treat duplicate metadata from a legacy/corrupt writer as one
+        // logical fence. Keep the highest value via validation above, then
+        // rewrite a single canonical entry.
+        list.lease_fences.retain(|fence| fence.strategy != name);
+        list.lease_fences.push(BundleLeaseFence {
+            strategy: name.to_string(),
+            epoch,
+        });
+    }
+    Ok(())
+}
+
+/// Advance the list's global and optional per-strategy fencing tokens using a
+/// conditional write. This runs before a new owner starts work and whenever a
+/// list writer retries after another owner changed the list.
+// LOAD-BEARING: the token write must win before a lease guard is used for
+// publication, or an in-flight stale CAS can overwrite a successor's list.
+async fn fence_bundle_list(
+    store: &Prefixed,
+    lease: &mut LeaseGuard,
+    ttl: Duration,
+    strategy: Option<(&str, u64)>,
+    max_retries: u32,
+) -> Result<(), BundleError> {
+    let key = keys::BUNDLE_LIST;
+    for _ in 0..max_retries.max(1) {
+        ensure_lease(lease, ttl).await?;
+        let current = store.get_bytes(key).await?;
+        let (mode, mut list) = match current {
+            None => (PutMode::Create, BundleList::default()),
+            Some((meta, data)) => (
+                PutMode::Update(meta.version),
+                BundleList::decode(data.as_ref())?,
+            ),
+        };
+        let before = list.clone();
+        apply_fence_metadata(&mut list, lease.fencing_token(), strategy)?;
+        if list == before {
+            return Ok(());
+        }
+        match store
+            .put(
+                key,
+                PutBody::from(list.encode_to_vec()),
+                PutOptions::from(mode),
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(StoreError::PreconditionFailed { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(BundleError::RetriesExhausted)
+}
+
 /// Try to acquire a lease at `leases/bundle-<strategy>.pb`.
 ///
 /// Returns `Ok(Some(guard))` if acquired, `Ok(None)` if held by another
@@ -510,7 +818,7 @@ pub async fn try_acquire_lease(
 ) -> Result<Option<LeaseGuard>, BundleError> {
     let relative_key = format!("{}bundle-{strategy}.pb", keys::LEASES_DIR);
     let key = format!("{}{}", store.prefix(), relative_key);
-    walgit_store::coord::try_acquire(
+    let lease = walgit_store::coord::try_acquire(
         store.inner().clone(),
         &key,
         instance_id(),
@@ -518,7 +826,30 @@ pub async fn try_acquire_lease(
         ttl,
     )
     .await
-    .map_err(|e| BundleError::Other(e.to_string()))
+    .map_err(|e| BundleError::Other(e.to_string()))?;
+    let Some(lease) = lease else {
+        return Ok(None);
+    };
+    let fencing_token = lease.fencing_token();
+    // The strategy lease and the shared list lease have independent fencing
+    // domains. Acquire the latter before recording the strategy token so a
+    // strategy takeover cannot mutate the list concurrently with a list
+    // writer from another strategy.
+    let list_lease_ttl = ttl.min(BUNDLE_LIST_LEASE_TTL);
+    let Some(list_lease) = acquire_list_lease(
+        store,
+        list_lease_ttl,
+        Duration::ZERO,
+        Some((strategy, fencing_token)),
+    )
+    .await?
+    else {
+        let _ = lease.release().await;
+        return Ok(None);
+    };
+    let list_release = list_lease.release().await;
+    list_release.map_err(|e| BundleError::Other(e.to_string()))?;
+    Ok(Some(lease))
 }
 
 /// Manually hold a lease for a strategy (prevents builds). Used in tests
@@ -802,17 +1133,6 @@ pub async fn build_and_upload(
 
     debug!(strategy = strategy_name, kind = kind_str, key = %entry.key, slot = cut.slot, "bundle uploaded");
     Ok(entry)
-}
-
-async fn ensure_lease(lease: &mut LeaseGuard, ttl: Duration) -> Result<(), BundleError> {
-    match lease
-        .renew_if_needed(ttl)
-        .await
-        .map_err(|e| BundleError::Other(e.to_string()))?
-    {
-        true => Ok(()),
-        false => Err(BundleError::LeaseLost),
-    }
 }
 
 /// Find the most recent bundle entry for `strategy` in `list`.

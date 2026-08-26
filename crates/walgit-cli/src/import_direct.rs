@@ -878,6 +878,7 @@ pub async fn run_with_store(
                 bundles: vec![],
                 updated_at: None,
                 skipped: vec![],
+                ..Default::default()
             });
             // A new full import supersedes older bundles of the same strategy and
             // every incremental built on them.
@@ -1183,30 +1184,9 @@ async fn cas_update_bundle_list<F>(
 where
     F: FnMut(Option<&BundleList>) -> BundleList,
 {
-    for _ in 0..16 {
-        let cur = store.get_bytes(keys::BUNDLE_LIST).await?;
-        let (mode, cur_list) = match &cur {
-            None => (PutMode::Create, None),
-            Some((meta, bytes)) => (
-                PutMode::Update(meta.version.clone()),
-                Some(BundleList::decode(bytes.as_ref())?),
-            ),
-        };
-        let new_list = f(cur_list.as_ref());
-        match store
-            .put(
-                keys::BUNDLE_LIST,
-                PutBody::Bytes(new_list.encode_to_vec().into()),
-                PutOptions::from(mode),
-            )
-            .await
-        {
-            Ok(meta) => return Ok((meta.version, new_list)),
-            Err(StoreError::PreconditionFailed { .. }) => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    bail!("bundle list CAS retries exhausted")
+    walgit_bundle::ops::cas_update_list(store, 16, |cur| Ok(Some(f(cur))))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("bundle list update was empty"))
 }
 
 #[cfg(test)]

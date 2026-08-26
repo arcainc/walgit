@@ -392,20 +392,46 @@ impl Bundler {
         let old_list = list;
         let new_entry = entry.clone();
         let bcfg = &cfg.bundles;
-        let cas_result = ops::cas_update_list(store, cfg.wal.cas_max_retries, |current| {
-            let mut list = current.cloned().unwrap_or_default();
-            list.mode = "all".into();
-            list.heuristic = "creationToken".into();
-            // Idempotent per slot: replace an entry for the same strategy+token.
-            list.bundles.retain(|b| {
-                !(b.strategy == new_entry.strategy && b.creation_token == new_entry.creation_token)
-            });
-            list.bundles.push(new_entry.clone());
-            slots::retain(bcfg, &mut list);
-            list.updated_at = Some(time::now());
-            Ok(Some(list))
-        })
-        .await?;
+        let cas_result = if let Some(lease) = lease.as_deref_mut() {
+            ops::cas_update_list_fenced(
+                store,
+                cfg.wal.cas_max_retries,
+                strategy_name,
+                lease,
+                self.lease_ttl,
+                |current| {
+                    let mut list = current.cloned().unwrap_or_default();
+                    list.mode = "all".into();
+                    list.heuristic = "creationToken".into();
+                    // Idempotent per slot: replace an entry for the same strategy+token.
+                    list.bundles.retain(|b| {
+                        !(b.strategy == new_entry.strategy
+                            && b.creation_token == new_entry.creation_token)
+                    });
+                    list.bundles.push(new_entry.clone());
+                    slots::retain(bcfg, &mut list);
+                    list.updated_at = Some(time::now());
+                    Ok(Some(list))
+                },
+            )
+            .await?
+        } else {
+            ops::cas_update_list(store, cfg.wal.cas_max_retries, |current| {
+                let mut list = current.cloned().unwrap_or_default();
+                list.mode = "all".into();
+                list.heuristic = "creationToken".into();
+                // Idempotent per slot: replace an entry for the same strategy+token.
+                list.bundles.retain(|b| {
+                    !(b.strategy == new_entry.strategy
+                        && b.creation_token == new_entry.creation_token)
+                });
+                list.bundles.push(new_entry.clone());
+                slots::retain(bcfg, &mut list);
+                list.updated_at = Some(time::now());
+                Ok(Some(list))
+            })
+            .await?
+        };
 
         // Delete pruned objects after CAS succeeds.
         if let Some((_, new_list)) = &cas_result {
@@ -717,7 +743,17 @@ impl Bundler {
                 None => {
                     tracing::info!(repo = %id, strategy = %strat.name, slot, "no WAL state as of this slot — not cut");
                     if slots::slot_closed(strat, slot, now) {
-                        ops::record_skipped(&store, &strat.name, slot, &base_id_now, 0, "no state as of the slot").await?;
+                        ops::record_skipped_fenced(
+                            &store,
+                            &strat.name,
+                            slot,
+                            &base_id_now,
+                            0,
+                            "no state as of the slot",
+                            &mut lease,
+                            self.lease_ttl,
+                        )
+                        .await?;
                     }
                     return Ok(None);
                 }
@@ -732,14 +768,34 @@ impl Bundler {
                     tracing::info!(repo = %id, strategy = %strat.name, slot, commits, min, "bundle slot too small — not cut (next slot catches up)");
                     // Final once the window is closed: the as-of state cannot change.
                     if slots::slot_closed(strat, slot, now) {
-                        ops::record_skipped(&store, &strat.name, slot, &base_id_now, seq, &format!("too-small: {commits} commits since base (min {min})")).await?;
+                        ops::record_skipped_fenced(
+                            &store,
+                            &strat.name,
+                            slot,
+                            &base_id_now,
+                            seq,
+                            &format!("too-small: {commits} commits since base (min {min})"),
+                            &mut lease,
+                            self.lease_ttl,
+                        )
+                        .await?;
                     }
                     Ok(None)
                 }
                 Err(BundleError::Unchanged { since }) => {
                     tracing::info!(repo = %id, strategy = %strat.name, slot, %since, "bundle slot unchanged — not cut");
                     if slots::slot_closed(strat, slot, now) {
-                        ops::record_skipped(&store, &strat.name, slot, &base_id_now, seq, &format!("unchanged since {since}")).await?;
+                        ops::record_skipped_fenced(
+                            &store,
+                            &strat.name,
+                            slot,
+                            &base_id_now,
+                            seq,
+                            &format!("unchanged since {since}"),
+                            &mut lease,
+                            self.lease_ttl,
+                        )
+                        .await?;
                     }
                     Ok(None)
                 }

@@ -257,6 +257,20 @@ message BundleList {
   // a restart the SSD host re-walked ~30 of them before reaching the live slot,
   // 2026-08-21). A new base bundle for the slot re-opens the question.
   repeated SkippedSlot skipped = 5;
+  // Fencing token of the shared bundle-list writer lease. Every list mutation
+  // must carry the token it observed; a successor first advances this field
+  // before it can publish, so an in-flight stale CAS fails on the list
+  // version. This is coordination metadata and is ignored by git clients.
+  uint64 list_lease_epoch = 6;
+  // Fencing tokens for the per-strategy build leases. A list writer that is
+  // publishing work for a strategy must match that strategy's token as well
+  // as the shared list-writer token.
+  repeated BundleLeaseFence lease_fences = 7;
+}
+
+message BundleLeaseFence {
+  string strategy = 1;
+  uint64 epoch = 2;
 }
 
 message SkippedSlot {
