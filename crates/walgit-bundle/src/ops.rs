@@ -628,6 +628,8 @@ pub async fn build_and_upload(
     prev_token: u64,
     now: SystemTime,
     filter: Option<&str>,
+    mut lease: Option<&mut LeaseGuard>,
+    lease_ttl: Duration,
 ) -> Result<BundleEntry, BundleError> {
     // 1. Resolve refs (tips): the slot's ref state, or the local copy's.
     let snap = match &cut.snapshot {
@@ -741,6 +743,13 @@ pub async fn build_and_upload(
     };
     let bundle_id = format!("{strategy_name}-{creation_token}");
 
+    // The bundle file may take longer to create than the maintenance lease
+    // allows. Revalidate immediately before the immutable object becomes
+    // externally visible; a stale owner must not publish after takeover.
+    if let Some(lease) = lease.as_deref_mut() {
+        ensure_lease(lease, lease_ttl).await?;
+    }
+
     let publish_span = tracing::info_span!("bundle.publish", strategy = strategy_name, key = %key, bytes = size, token = creation_token, slot = cut.slot);
     let version = match store
         .put(
@@ -767,6 +776,13 @@ pub async fn build_and_upload(
         Err(e) => return Err(e.into()),
     };
 
+    // The upload itself can outlive the lease too. Check again before the
+    // caller CASes the bundle list, so an old owner can leave at most an
+    // unreferenced immutable object—not a stale advertised bundle.
+    if let Some(lease) = lease.as_deref_mut() {
+        ensure_lease(lease, lease_ttl).await?;
+    }
+
     // 5. Build the entry.
     let entry = BundleEntry {
         id: bundle_id,
@@ -786,6 +802,17 @@ pub async fn build_and_upload(
 
     debug!(strategy = strategy_name, kind = kind_str, key = %entry.key, slot = cut.slot, "bundle uploaded");
     Ok(entry)
+}
+
+async fn ensure_lease(lease: &mut LeaseGuard, ttl: Duration) -> Result<(), BundleError> {
+    match lease
+        .renew_if_needed(ttl)
+        .await
+        .map_err(|e| BundleError::Other(e.to_string()))?
+    {
+        true => Ok(()),
+        false => Err(BundleError::LeaseLost),
+    }
 }
 
 /// Find the most recent bundle entry for `strategy` in `list`.

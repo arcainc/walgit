@@ -72,6 +72,8 @@ pub enum BundleError {
     Unchanged { since: String },
     #[error("CAS retries exhausted")]
     RetriesExhausted,
+    #[error("bundle lease lost before publication")]
+    LeaseLost,
     #[error("other: {0}")]
     Other(String),
 }
@@ -168,12 +170,35 @@ impl Bundler {
     /// Create a bundler from any [`BundleSource`]. Used by tests and
     /// internally by [`Bundler::new`] (which requires `walgit-wal`).
     pub fn new_with_source(source: Arc<dyn BundleSource>, cfg: Arc<Config>) -> Arc<Self> {
+        Self::new_with_source_and_lease_ttl(source, cfg, Duration::from_secs(30 * 60))
+    }
+
+    /// Create a bundler with an explicit maintenance lease TTL.
+    ///
+    /// Production callers should use [`Self::new_with_source`]. The explicit
+    /// form keeps lease-expiry behavior deterministic in adversarial tests.
+    pub fn new_with_source_and_lease_ttl(
+        source: Arc<dyn BundleSource>,
+        cfg: Arc<Config>,
+        lease_ttl: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             source,
             cfg,
             gates: Default::default(),
-            lease_ttl: Duration::from_secs(30 * 60),
+            lease_ttl,
         })
+    }
+
+    async fn ensure_lease(&self, lease: &mut LeaseGuard) -> Result<(), BundleError> {
+        match lease
+            .renew_if_needed(self.lease_ttl)
+            .await
+            .map_err(|e| BundleError::Other(e.to_string()))?
+        {
+            true => Ok(()),
+            false => Err(BundleError::LeaseLost),
+        }
     }
 
     /// Create a bundler backed by `walgit_wal::Registry`.
@@ -207,7 +232,14 @@ impl Bundler {
         self.source.prepare_objects(id).await?;
         let mut handle = self.source.open_repo(id).await?;
         handle.engine = self.source.engine(id).await;
-        self.build_with_handle(&handle, strategy).await
+        let mut lease = ops::try_acquire_lease(&handle.store, strategy, self.lease_ttl)
+            .await?
+            .ok_or_else(|| BundleError::Other("bundle lease held".into()))?;
+        let result = self
+            .build_with_handle(&handle, strategy, Some(&mut lease))
+            .await;
+        lease.release().await.ok();
+        result
     }
 
     /// Internal build that reuses an open handle (avoids re-opening for the
@@ -216,13 +248,14 @@ impl Bundler {
         &self,
         handle: &BundleRepoHandle,
         strategy_name: &str,
+        lease: Option<&mut LeaseGuard>,
     ) -> Result<BundleEntry, BundleError> {
         let cut = ops::Cut {
             slot: 0,
             snapshot: None,
             seq: handle.head_seq,
         };
-        self.build_slot(handle, strategy_name, &cut).await
+        self.build_slot(handle, strategy_name, &cut, lease).await
     }
 
     /// Build `strategy_name` for `cut` (a calendar slot with its ref state, or
@@ -233,7 +266,11 @@ impl Bundler {
         handle: &BundleRepoHandle,
         strategy_name: &str,
         cut: &ops::Cut,
+        mut lease: Option<&mut LeaseGuard>,
     ) -> Result<BundleEntry, BundleError> {
+        if let Some(lease) = lease.as_deref_mut() {
+            self.ensure_lease(lease).await?;
+        }
         let cfg = self.cfg_for(handle);
         let strat = self.find_strategy(cfg, strategy_name)?;
         let store = &handle.store;
@@ -342,8 +379,14 @@ impl Bundler {
             prev_token,
             now,
             strat.filter.as_deref(),
+            lease.as_deref_mut(),
+            self.lease_ttl,
         )
         .await?;
+
+        if let Some(lease) = lease.as_deref_mut() {
+            self.ensure_lease(lease).await?;
+        }
 
         // CAS update the bundle list (append + prune).
         let old_list = list;
@@ -642,7 +685,7 @@ impl Bundler {
         let strat = self.find_strategy(&cfg, strategy)?.clone();
         let strat = &strat;
         let store = handle.store.clone();
-        let lease = match ops::try_acquire_lease(&store, &strat.name, self.lease_ttl).await? {
+        let mut lease = match ops::try_acquire_lease(&store, &strat.name, self.lease_ttl).await? {
             Some(l) => l,
             None => return Ok(None),
         };
@@ -680,7 +723,10 @@ impl Bundler {
                 }
             };
             let cut = ops::Cut { slot, snapshot, seq };
-            match self.build_slot(&handle, &strat.name, &cut).await {
+            match self
+                .build_slot(&handle, &strat.name, &cut, Some(&mut lease))
+                .await
+            {
                 Ok(e) => Ok(Some(e)),
                 Err(BundleError::TooSmall { commits, min }) => {
                     tracing::info!(repo = %id, strategy = %strat.name, slot, commits, min, "bundle slot too small — not cut (next slot catches up)");
@@ -736,7 +782,8 @@ impl Bundler {
             if missing.is_empty() {
                 continue;
             }
-            let lease = match ops::try_acquire_lease(store, &strat.name, self.lease_ttl).await? {
+            let mut lease = match ops::try_acquire_lease(store, &strat.name, self.lease_ttl).await?
+            {
                 Some(l) => l,
                 None => {
                     debug!(strategy = %strat.name, "lease held, skipping");
@@ -767,13 +814,17 @@ impl Bundler {
                     todo.truncate(strat.backfill_max);
                 }
                 for slot in todo {
+                    self.ensure_lease(&mut lease).await?;
                     let at = slots::from_epoch(slot);
                     let (snapshot, seq) = match self.source.refs_as_of(id, at).await? {
                         Some((snap, seq)) => (Some(snap), seq),
                         None => (None, handle.head_seq),
                     };
                     let cut = ops::Cut { slot, snapshot, seq };
-                    match self.build_slot(&handle, &strat.name, &cut).await {
+                    match self
+                        .build_slot(&handle, &strat.name, &cut, Some(&mut lease))
+                        .await
+                    {
                         Ok(entry) => {
                             debug!(strategy = %strat.name, slot, seq, "slot built");
                             built.push(entry);

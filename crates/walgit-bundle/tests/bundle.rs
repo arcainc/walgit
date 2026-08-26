@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 use tokio::process::Command;
+use tokio::sync::Notify;
 
 use walgit_bundle::{BundleError, BundleRepoHandle, BundleSource, Bundler, RepoId, ops};
 use walgit_config::{BundleKind, BundleServe, BundleStrategy, BundlesConfig, Config};
@@ -109,10 +110,51 @@ impl TestSource {
     }
 
     fn add(&mut self, tr: &TestRepo, id: RepoId) {
-        self.repos.insert(
-            id,
-            (tr.local.clone(), tr.store.clone(), tr.head_seq.clone()),
-        );
+        self.add_store(&tr.local, &tr.store, &tr.head_seq, id);
+    }
+
+    fn add_store(
+        &mut self,
+        local: &LocalRepo,
+        store: &Prefixed,
+        head_seq: &Arc<AtomicU64>,
+        id: RepoId,
+    ) {
+        self.repos
+            .insert(id, (local.clone(), store.clone(), head_seq.clone()));
+    }
+}
+
+/// A source that pauses after maintenance acquires its lease. This lets the
+/// test steal that lease before the owner reaches any publish step.
+struct BlockingSource {
+    local: LocalRepo,
+    store: Prefixed,
+    head_seq: Arc<AtomicU64>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl BundleSource for BlockingSource {
+    async fn open_repo(&self, _id: &RepoId) -> Result<BundleRepoHandle, BundleError> {
+        Ok(BundleRepoHandle {
+            local: self.local.clone(),
+            store: self.store.clone(),
+            head_seq: self.head_seq.load(Ordering::Relaxed),
+            engine: Default::default(),
+            cfg: None,
+        })
+    }
+
+    async fn prepare_objects(&self, _id: &RepoId) -> Result<(), BundleError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+
+    async fn list_repos(&self) -> Result<Vec<RepoId>, BundleError> {
+        Ok(Vec::new())
     }
 }
 
@@ -562,6 +604,59 @@ async fn run_due_respects_schedule_and_lease() {
     assert!(
         built5.is_empty(),
         "should skip (lease held by another holder)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_bundle_owner_cannot_publish_after_lease_reclaimed() {
+    let tr = TestRepo::new("test", "stale-owner").await;
+    tr.commit("initial").await;
+    tr.push().await;
+    tr.advance_seq();
+
+    let id = RepoId::new("test", "stale-owner").unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let source = Arc::new(BlockingSource {
+        local: tr.local.clone(),
+        store: tr.store.clone(),
+        head_seq: tr.head_seq.clone(),
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let cfg = Arc::new(cfg_full_only(4));
+    let bundler = Bundler::new_with_source_and_lease_ttl(source, cfg, Duration::from_millis(50));
+
+    let run = tokio::spawn({
+        let bundler = bundler.clone();
+        let id = id.clone();
+        async move { bundler.run_due(&id, SystemTime::now()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("bundle owner never reached the blocked preparation step");
+
+    // The lease is expired, including the protocol's skew grace. A successor
+    // can now reclaim it while the old owner is still in prepare_objects.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let successor = ops::try_acquire_lease(&tr.store, "weekly", Duration::from_millis(50))
+        .await
+        .unwrap()
+        .expect("successor should reclaim the expired bundle lease");
+    successor.release().await.unwrap();
+    release.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("stale bundle owner hung")
+        .expect("stale bundle owner task panicked");
+    assert!(
+        matches!(result, Err(BundleError::LeaseLost)),
+        "stale owner must stop before publishing, got {result:?}"
+    );
+    assert!(
+        ops::read_list(&tr.store).await.unwrap().is_none(),
+        "stale owner published a bundle list after lease takeover"
     );
 }
 
