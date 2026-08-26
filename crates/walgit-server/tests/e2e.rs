@@ -1011,12 +1011,14 @@ async fn lfs_upload_batch_requires_write_permission() -> TestResult {
                 token: "writer".into(),
                 token_env: None,
                 write: true,
+                admin: false,
             },
             walgit_config::StaticToken {
                 principal: "reader@example.com".into(),
                 token: "reader".into(),
                 token_env: None,
                 write: false,
+                admin: false,
             },
         ];
     })

@@ -448,6 +448,7 @@ pub fn instance_id() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fault::{FaultPlan, FaultStore};
     use crate::memory::MemoryStore;
     use walgit_proto::v1::RepoCatalog;
 
@@ -559,6 +560,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cat.repos.len(), N as usize);
+    }
+
+    #[tokio::test]
+    async fn cas_and_lease_exclusivity_survive_delayed_responses() {
+        let truth: DynStore = MemoryStore::shared();
+        let link = FaultStore::new(truth, "delayed", 0xD1A5);
+        link.set(FaultPlan {
+            delay: Some((Duration::from_millis(2), Duration::from_millis(10))),
+            delay_after: Some(Duration::from_millis(8)),
+            ..Default::default()
+        });
+        let store: DynStore = link;
+
+        let mut cas_handles = Vec::new();
+        for i in 0..32u32 {
+            let s = store.clone();
+            cas_handles.push(tokio::spawn(async move {
+                let tag = format!("delayed-{i}");
+                cas_update::<RepoCatalog, _>(s.as_ref(), "delayed-counter.pb", 500, |current| {
+                    let mut cat = current.cloned().unwrap_or_default();
+                    cat.repos.push(tag.clone());
+                    Ok(Some(cat))
+                })
+                .await
+            }));
+        }
+        for h in cas_handles {
+            h.await.unwrap().unwrap();
+        }
+        let (_, cat) = get_message::<RepoCatalog>(store.as_ref(), "delayed-counter.pb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cat.repos.len(), 32);
+
+        let mut lease_handles = Vec::new();
+        for i in 0..32u32 {
+            let s = store.clone();
+            lease_handles.push(tokio::spawn(async move {
+                try_acquire(
+                    s,
+                    "leases/delayed.pb",
+                    &format!("h{i}"),
+                    "delayed",
+                    Duration::from_secs(60),
+                )
+                .await
+            }));
+        }
+        let mut acquired = 0;
+        for h in lease_handles {
+            if h.await.unwrap().unwrap().is_some() {
+                acquired += 1;
+            }
+        }
+        assert_eq!(acquired, 1);
     }
 
     #[tokio::test]
