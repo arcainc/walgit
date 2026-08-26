@@ -212,6 +212,19 @@ pub async fn compose_full_from_base(
     let list = walgit_bundle::ops::read_list(store)
         .await?
         .unwrap_or_default();
+    let mut strategy_lease = walgit_bundle::ops::try_acquire_lease(
+        store,
+        strategy,
+        walgit_bundle::ops::BUNDLE_LIST_LEASE_TTL,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("bundle lease held for strategy {strategy}"))?;
+    if !strategy_lease
+        .renew_if_needed(walgit_bundle::ops::BUNDLE_LIST_LEASE_TTL)
+        .await?
+    {
+        return Err(anyhow::anyhow!("bundle lease lost for strategy {strategy}"));
+    }
     let prev_token = walgit_bundle::ops::max_creation_token(&list);
     let now = std::time::SystemTime::now();
     let format = handle.local().object_format();
@@ -254,19 +267,36 @@ pub async fn compose_full_from_base(
         slot,
         filter.as_deref(),
     )
-    .await?;
+    .await;
+    let entry = match entry {
+        Ok(entry) => entry,
+        Err(error) => {
+            let _ = strategy_lease.release().await;
+            return Err(error.into());
+        }
+    };
     let new_entry = entry.clone();
     let old_list = list;
-    let cas = walgit_bundle::ops::cas_update_list(store, cfg.wal.cas_max_retries, |current| {
-        let mut l = current.cloned().unwrap_or_default();
-        l.mode = "all".into();
-        l.heuristic = "creationToken".into();
-        l.bundles.push(new_entry.clone());
-        walgit_bundle::slots::retain(&cfg.bundles, &mut l);
-        l.updated_at = Some(walgit_proto::time::now());
-        Ok(Some(l))
-    })
-    .await?;
+    let cas = walgit_bundle::ops::cas_update_list_fenced(
+        store,
+        cfg.wal.cas_max_retries,
+        strategy,
+        &mut strategy_lease,
+        walgit_bundle::ops::BUNDLE_LIST_LEASE_TTL,
+        |current| {
+            let mut l = current.cloned().unwrap_or_default();
+            l.mode = "all".into();
+            l.heuristic = "creationToken".into();
+            l.bundles.push(new_entry.clone());
+            walgit_bundle::slots::retain(&cfg.bundles, &mut l);
+            l.updated_at = Some(walgit_proto::time::now());
+            Ok(Some(l))
+        },
+    )
+    .await;
+    let release = strategy_lease.release().await;
+    let cas = cas?;
+    release?;
     if let Some((_, new_list)) = &cas {
         let pruned = walgit_bundle::ops::pruned_diff(&old_list, new_list);
         if !pruned.is_empty() {
