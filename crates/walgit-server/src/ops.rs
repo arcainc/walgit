@@ -743,9 +743,17 @@ pub async fn compact_repo(
         cfg.compaction.lease_ttl,
     )
     .await?;
-    let Some(lease) = lease else {
+    let Some(mut lease) = lease else {
         return Ok(CompactOutcome::LeaseHeld);
     };
+
+    // The create/update response can be delayed past the lease TTL. Confirm
+    // the version we acquired is still current before doing any work; a
+    // successor may have reclaimed it while this owner was waiting for the
+    // response. A stale owner must not publish a compaction it no longer owns.
+    if !lease.renew_if_needed(cfg.compaction.lease_ttl).await? {
+        return Ok(CompactOutcome::LeaseHeld);
+    }
 
     // A geometric fold never touches the base or a history pack (D18): both are `--keep-pack`'d.
     // On 2026-08-22 a fold on the SSD host (every pack a real local file) rolled a large repository's 32 GB base
@@ -761,7 +769,9 @@ pub async fn compact_repo(
     // BUNDLE_URI_DESIGN §5a). It installs + publishes itself; the lease is ours until it returns.
     if rebuild_base {
         log("lease acquired; base rebuild in a scratch copy (resumable)".to_string());
-        let out = crate::rebuild::rebuild_base(handle, cfg, log).await;
+        let out =
+            crate::rebuild::rebuild_base(handle, cfg, log, &mut lease, cfg.compaction.lease_ttl)
+                .await;
         if let Err(e) = lease.release().await {
             log(format!("lease release failed: {e}"));
         }
@@ -817,6 +827,19 @@ pub async fn compact_repo(
     let mut packs = Vec::new();
     let mut first_err = None;
     for p in &result.new_packs {
+        match lease.renew_if_needed(cfg.compaction.lease_ttl).await {
+            Ok(true) => {}
+            Ok(false) => {
+                first_err.get_or_insert(walgit_wal::WalError::Coord(
+                    walgit_store::coord::CoordError::LeaseLost,
+                ));
+                break;
+            }
+            Err(e) => {
+                first_err.get_or_insert(e.into());
+                break;
+            }
+        }
         let hex = p.checksum.to_hex().to_string();
         let size = p.pack_size;
         match handle

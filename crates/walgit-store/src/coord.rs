@@ -251,6 +251,24 @@ impl LeaseGuard {
         }
     }
 
+    /// Renew only when the local validity window is nearly exhausted. A store
+    /// response may itself arrive after the renewed expiry, so retry the CAS
+    /// once and report `false` unless a usable window is confirmed.
+    pub async fn renew_if_needed(&mut self, ttl: Duration) -> Result<bool, CoordError> {
+        let margin = ttl / 3;
+        for _ in 0..2 {
+            if self.expires_at > SystemTime::now() + margin {
+                return Ok(true);
+            }
+            match self.heartbeat(ttl).await {
+                Ok(()) => {}
+                Err(CoordError::LeaseLost) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(self.expires_at > SystemTime::now() + margin)
+    }
+
     /// Confirmed CAS release. Consumes the guard. `Ok(())` even if the lease
     /// was already stolen (the desired end state — no one holds it in our
     /// name).
@@ -616,6 +634,38 @@ mod tests {
             }
         }
         assert_eq!(acquired, 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_lease_heartbeat_response_is_not_reported_live() {
+        let truth: DynStore = MemoryStore::shared();
+        let link = FaultStore::new(truth, "lease-delay", 0xD1A5);
+        let key = "leases/delayed-heartbeat.pb";
+        let mut guard = try_acquire(
+            link.clone() as DynStore,
+            key,
+            "h1",
+            "delayed",
+            Duration::from_millis(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        link.set(FaultPlan {
+            delay_after: Some(Duration::from_millis(30)),
+            delay_after_ops: Some(vec!["put".into()]),
+            only_keys: Some(vec![key.into()]),
+            ..FaultPlan::default()
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(
+            !guard
+                .renew_if_needed(Duration::from_millis(5))
+                .await
+                .unwrap(),
+            "a late heartbeat response must not claim a usable lease window"
+        );
     }
 
     #[tokio::test]

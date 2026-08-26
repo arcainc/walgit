@@ -217,6 +217,13 @@ struct Cluster {
 
 impl Cluster {
     async fn new(seed: u64, n: usize) -> Result<Self> {
+        Self::new_with_tweak(seed, n, &|_| {}).await
+    }
+    async fn new_with_tweak(
+        seed: u64,
+        n: usize,
+        tweak: &dyn Fn(&mut walgit_config::Config),
+    ) -> Result<Self> {
         let truth: DynStore = MemoryStore::shared();
         let id = RepoId::new("sim", &format!("r{seed}"))?;
         let mut c = Cluster {
@@ -227,7 +234,7 @@ impl Cluster {
             next_link_seed: AtomicU64::new(seed * 1000),
         };
         for i in 0..n {
-            c.add_instance(&format!("i{i}"), &|_| {});
+            c.add_instance(&format!("i{i}"), tweak);
         }
         // Create through a healthy link.
         c.instances[0]
@@ -357,6 +364,21 @@ struct Acked {
     refname: String,
     old: String,
     new: String,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryPush {
+    ack: Acked,
+    started: Instant,
+    finished: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryRead {
+    refname: String,
+    observed: String,
+    started: Instant,
+    finished: Instant,
 }
 
 struct Pusher {
@@ -670,6 +692,119 @@ async fn check_truth(c: &Cluster, pushers: &[Pusher]) -> Result<()> {
         ensure!(
             handle.local().has_object(&id),
             "observer lacks tip {oid} of {name} after full sync"
+        );
+    }
+    Ok(())
+}
+
+/// Independent history oracle for a concurrent run. It checks the committed
+/// WAL as a linearizable register history, rather than trusting the pusher's
+/// local state: every acknowledged operation has a matching log event, WAL
+/// old-values form a valid per-ref chain, and non-overlapping calls respect
+/// real-time order. Reads that begin after an ACK must observe that ACK or a
+/// later write on the same ref.
+async fn check_linearizable_history(
+    c: &Cluster,
+    pushes: &[HistoryPush],
+    reads: &[HistoryRead],
+) -> Result<()> {
+    let observer = c.observer();
+    let handle = observer.open(&c.id).await?;
+    let log = handle.read_log(1, None).await?;
+    let by_seq: BTreeMap<u64, _> = log.iter().map(|e| (e.seq, e)).collect();
+
+    let mut current = HashMap::<String, String>::new();
+    let mut committed = HashMap::<(String, String), u64>::new();
+    for entry in &log {
+        let Some(txn) = &entry.txn else {
+            continue;
+        };
+        for update in &txn.updates {
+            let before = current.get(&update.name).cloned().unwrap_or_default();
+            ensure!(
+                update.old_oid == before,
+                "WAL old value for {} at seq {} was {}, model has {}",
+                update.name,
+                entry.seq,
+                update.old_oid,
+                before
+            );
+            current.insert(update.name.clone(), update.new_oid.clone());
+            committed.insert((update.name.clone(), update.new_oid.clone()), entry.seq);
+        }
+    }
+
+    for op in pushes {
+        let entry = by_seq
+            .get(&op.ack.seq)
+            .ok_or_else(|| anyhow!("ACK seq {} is absent from the WAL", op.ack.seq))?;
+        ensure!(
+            entry.kind == EntryKind::Push as i32,
+            "ACK seq {} has non-PUSH kind {}",
+            op.ack.seq,
+            entry.kind
+        );
+        let txn = entry
+            .txn
+            .as_ref()
+            .ok_or_else(|| anyhow!("ACK seq {} has no transaction", op.ack.seq))?;
+        ensure!(
+            txn.updates.iter().any(|u| {
+                u.name == op.ack.refname && u.old_oid == op.ack.old && u.new_oid == op.ack.new
+            }),
+            "ACK {:?} does not match its WAL transaction",
+            op.ack
+        );
+    }
+
+    for a in pushes {
+        for b in pushes {
+            if a.finished <= b.started {
+                ensure!(
+                    a.ack.seq < b.ack.seq,
+                    "real-time order violated: seq {} completed before seq {} began",
+                    a.ack.seq,
+                    b.ack.seq
+                );
+            }
+        }
+    }
+
+    for read in reads {
+        ensure!(
+            read.started <= read.finished,
+            "read interval is inverted for {}",
+            read.refname
+        );
+        let prior: Vec<_> = pushes
+            .iter()
+            .filter(|p| p.ack.refname == read.refname && p.finished <= read.started)
+            .collect();
+        let Some(latest) = prior.iter().max_by_key(|p| p.ack.seq) else {
+            ensure!(
+                read.observed.is_empty(),
+                "read of {} returned {} before any ACK",
+                read.refname,
+                read.observed
+            );
+            continue;
+        };
+        let observed_seq = committed
+            .get(&(read.refname.clone(), read.observed.clone()))
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "read of {} returned unknown tip {}",
+                    read.refname,
+                    read.observed
+                )
+            })?;
+        ensure!(
+            observed_seq >= latest.ack.seq,
+            "read of {} started after seq {} ACK but returned seq {}",
+            read.refname,
+            latest.ack.seq,
+            observed_seq
         );
     }
     Ok(())
@@ -1166,6 +1301,233 @@ async fn sim_delayed_snapshot_cannot_poison_reader() {
     run_delayed_snapshot_cannot_poison_reader(0xD1A5_0003)
         .await
         .unwrap();
+}
+
+/// A lease acquisition response can be delayed past expiry: the bucket has
+/// already accepted owner A's lease, but A has not learned that fact when
+/// owner B reclaims it. A must not resume and publish a compaction after B's
+/// takeover.
+async fn run_stale_compaction_owner_cannot_publish(seed: u64) -> Result<()> {
+    let c = Cluster::new_with_tweak(seed, 2, &|cfg| {
+        cfg.compaction.lease_ttl = Duration::from_millis(50);
+    })
+    .await?;
+    let mut p = Pusher::new(0);
+    for _ in 0..2 {
+        ensure!(
+            p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+                .await?
+        );
+    }
+
+    let old_handle = c.instances[0].open(&c.id).await?;
+    let old_cfg = c.instances[0].cfg.clone();
+    c.instances[0].link.set(FaultPlan {
+        delay_after: Some(Duration::from_millis(2_500)),
+        delay_after_ops: Some(vec!["put".into()]),
+        only_keys: Some(vec![walgit_proto::keys::lease_key("compact")]),
+        ..FaultPlan::default()
+    });
+    let old = tokio::spawn(async move {
+        walgit_server::ops::compact_repo(
+            &old_handle,
+            &old_cfg,
+            walgit_server::ops::CompactRequest {
+                force: true,
+                rebuild_base: false,
+            },
+            &walgit_server::ops::noop_log,
+        )
+        .await
+    });
+
+    let lease_key = format!(
+        "{}{}",
+        c.repo_prefix(),
+        walgit_proto::keys::lease_key("compact")
+    );
+    for _ in 0..500 {
+        if c.truth.exists(&lease_key).await? {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    ensure!(
+        c.truth.exists(&lease_key).await?,
+        "old owner never created the lease before its response was delayed; stats={} traces:\n{}",
+        c.instances[0].link.stats().summary(),
+        c.dump_traces()
+    );
+
+    // The lease is expired by now, including the store's clock-skew grace.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let successor = c.instances[1].open(&c.id).await?;
+    let successor = tokio::time::timeout(
+        Duration::from_secs(10),
+        walgit_server::ops::compact_repo(
+            &successor,
+            &c.instances[1].cfg,
+            walgit_server::ops::CompactRequest {
+                force: true,
+                rebuild_base: false,
+            },
+            &walgit_server::ops::noop_log,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("successor compaction timed out"))??;
+    ensure!(
+        matches!(
+            successor,
+            walgit_server::ops::CompactOutcome::Published { .. }
+        ),
+        "successor did not compact after the old lease expired: {successor:?}"
+    );
+
+    let old = tokio::time::timeout(Duration::from_secs(10), old)
+        .await
+        .map_err(|_| anyhow!("stale owner compaction timed out"))??;
+    ensure!(
+        !matches!(
+            old,
+            Ok(walgit_server::ops::CompactOutcome::Published { .. })
+        ),
+        "stale owner published after successor takeover: {old:?}"
+    );
+    check_truth(&c, &[p]).await
+}
+
+async fn run_linearizable_history(seed: u64) -> Result<()> {
+    let c = Cluster::new(seed, 3).await?;
+    for inst in &c.instances {
+        inst.link.set(FaultPlan {
+            delay: Some((Duration::from_millis(1), Duration::from_millis(8))),
+            delay_after: Some(Duration::from_millis(5)),
+            ..FaultPlan::default()
+        });
+    }
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(c.instances.len() + 1));
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<Acked>();
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<HistoryPush>();
+    let (read_tx, mut read_rx) = tokio::sync::mpsc::unbounded_channel::<HistoryRead>();
+    let observer = c.observer();
+    let reader_registry = observer.registry.clone();
+    let reader_id = c.id.clone();
+    let reader = tokio::spawn(async move {
+        let _keep_alive = observer;
+        let handle = reader_registry.open(&reader_id).await?;
+        while let Some(ack) = ack_rx.recv().await {
+            let started = Instant::now();
+            drop(
+                tokio::time::timeout(Duration::from_secs(10), handle.sync_refs())
+                    .await
+                    .map_err(|_| anyhow!("history reader timed out after seq {}", ack.seq))??,
+            );
+            let observed = handle
+                .local()
+                .refs()
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .refs
+                        .into_iter()
+                        .find(|r| r.name == ack.refname)
+                        .map(|r| r.oid)
+                })
+                .unwrap_or_default();
+            read_tx
+                .send(HistoryRead {
+                    refname: ack.refname,
+                    observed,
+                    started,
+                    finished: Instant::now(),
+                })
+                .map_err(|_| anyhow!("history reader lost its result channel"))?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let mut writers = Vec::new();
+    for i in 0..c.instances.len() {
+        let inst = Instance {
+            name: format!("history-{i}"),
+            link: c.instances[i].link.clone(),
+            registry: c.instances[i].registry.clone(),
+            cfg: c.instances[i].cfg.clone(),
+            _cache: tempfile::tempdir().unwrap(),
+        };
+        let barrier = barrier.clone();
+        let id = c.id.clone();
+        let ack_tx = ack_tx.clone();
+        let push_tx = push_tx.clone();
+        writers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut p = Pusher::new(i);
+            for _ in 0..5 {
+                let started = Instant::now();
+                ensure!(
+                    p.push_once(&inst, &id, Duration::from_secs(10)).await?,
+                    "history writer {i} failed: {:?}",
+                    p.errors.last()
+                );
+                let finished = Instant::now();
+                let ack = p.acked.last().cloned().unwrap();
+                ack_tx.send(ack.clone()).unwrap();
+                push_tx
+                    .send(HistoryPush {
+                        ack,
+                        started,
+                        finished,
+                    })
+                    .unwrap();
+            }
+            Ok::<Pusher, anyhow::Error>(p)
+        }));
+    }
+    barrier.wait().await;
+
+    let mut pushers = Vec::new();
+    for writer in writers {
+        pushers.push(writer.await??);
+    }
+    drop(ack_tx);
+    drop(push_tx);
+    reader.await??;
+
+    let mut pushes = Vec::new();
+    while let Some(push) = push_rx.recv().await {
+        pushes.push(push);
+    }
+    let mut reads = Vec::new();
+    while let Some(read) = read_rx.recv().await {
+        reads.push(read);
+    }
+    ensure!(
+        pushes.len() == 15,
+        "history did not record every ACK: {}",
+        pushes.len()
+    );
+    ensure!(
+        reads.len() == pushes.len(),
+        "history did not record every read: {} vs {}",
+        reads.len(),
+        pushes.len()
+    );
+    check_linearizable_history(&c, &pushes, &reads).await?;
+    check_truth(&c, &pushers).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn sim_stale_compaction_owner_cannot_publish_after_lease_reclaimed() {
+    run_stale_compaction_owner_cannot_publish(0xD1A5_0004)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sim_ack_history_is_linearizable_under_concurrency() {
+    run_linearizable_history(0xD1A5_0005).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
