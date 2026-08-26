@@ -48,9 +48,10 @@ use crate::{
 pub struct FaultPlan {
     /// Uniform latency added to every op, before it is applied.
     pub delay: Option<(Duration, Duration)>,
-    /// Latency added to reads (`get`/`head`) AFTER the inner op: the answer was taken from the store
-    /// at the earlier instant and arrives late — a slow network delivering an already-stale snapshot
-    /// (what a conditional GET racing a local publish looks like). Honours `only_keys`.
+    /// Latency added AFTER the inner op: the operation has taken effect (or
+    /// captured its read result) but the response arrives late. This models a
+    /// slow network delivering an already-stale snapshot or a delayed write
+    /// acknowledgement. Honours `only_keys`.
     pub delay_after: Option<Duration>,
     /// `Retryable` before the op is applied (get/head/put/delete/list/compose).
     pub p_err_before: f64,
@@ -356,6 +357,17 @@ impl FaultStore {
             self.name
         ))
     }
+
+    async fn delay_after(&self, op: &str, key: &str) {
+        let plan = self.plan();
+        if let Some(d) = plan.delay_after.filter(|_| Self::in_scope(&plan, key)) {
+            self.log(format!(
+                "{} {op} {key}: response delivered {d:?} late",
+                self.name
+            ));
+            tokio::time::sleep(d).await;
+        }
+    }
 }
 
 async fn hang_forever<T>() -> T {
@@ -404,62 +416,58 @@ impl ObjectStore for FaultStore {
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
         let conditional = opts.if_none_match.is_some();
-        let late = {
-            let plan = self.plan();
-            plan.delay_after.filter(|_| Self::in_scope(&plan, key))
-        };
         let r = self.get_inner(key, opts, conditional).await;
-        if let Some(d) = late {
-            self.log(format!(
-                "{} get {key}: answer delivered {d:?} late (conditional={conditional})",
-                self.name
-            ));
-            tokio::time::sleep(d).await;
-        }
+        self.delay_after("get", key).await;
         r
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
-        match self.decide("head", key, false, false, false).await {
+        let result = match self.decide("head", key, false, false, false).await {
             Decision::Hang => hang_forever().await,
             Decision::ErrBefore => Err(self.retryable("head", key, "before")),
             Decision::Denied => Ok(None),
             _ => self.inner.head(key).await,
-        }
+        };
+        self.delay_after("head", key).await;
+        result
     }
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
         let conditional = !matches!(opts.mode, PutMode::Overwrite);
-        match self.decide("put", key, true, conditional, false).await {
+        let result = match self.decide("put", key, true, conditional, false).await {
             Decision::Hang => hang_forever().await,
             Decision::ErrBefore => Err(self.retryable("put", key, "before")),
             Decision::CasFail => Err(StoreError::PreconditionFailed {
                 key: key.into(),
                 current: None,
             }),
-            Decision::ErrAfter => {
-                let _ = self.inner.put(key, body, opts).await?;
-                Err(self.retryable("put", key, "after (applied)"))
-            }
+            Decision::ErrAfter => match self.inner.put(key, body, opts).await {
+                Ok(_) => Err(self.retryable("put", key, "after (applied)")),
+                Err(e) => Err(e),
+            },
             _ => self.inner.put(key, body, opts).await,
-        }
+        };
+        self.delay_after("put", key).await;
+        result
     }
 
     async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
         let conditional = if_version.is_some();
-        match self.decide("delete", key, true, conditional, false).await {
+        let result = match self.decide("delete", key, true, conditional, false).await {
             Decision::Hang => hang_forever().await,
             Decision::ErrBefore => Err(self.retryable("delete", key, "before")),
             Decision::CasFail => Err(StoreError::PreconditionFailed {
                 key: key.into(),
                 current: None,
             }),
-            Decision::ErrAfter => {
-                self.inner.delete(key, if_version).await?;
-                Err(self.retryable("delete", key, "after (applied)"))
-            }
+            Decision::ErrAfter => match self.inner.delete(key, if_version).await {
+                Ok(()) => Err(self.retryable("delete", key, "after (applied)")),
+                Err(e) => Err(e),
+            },
             _ => self.inner.delete(key, if_version).await,
-        }
+        };
+        self.delay_after("delete", key).await;
+        result
     }
 
     fn list(
@@ -479,7 +487,21 @@ impl ObjectStore for FaultStore {
             let e = self.retryable("list", prefix, "before");
             return Box::pin(futures::stream::once(async move { Err(e) }));
         }
-        self.inner.list(prefix, start_after)
+        let inner = self.inner.list(prefix, start_after);
+        let Some(d) = plan.delay_after.filter(|_| Self::in_scope(&plan, prefix)) else {
+            return inner;
+        };
+        self.log(format!(
+            "{} list {prefix}: response delivered {d:?} late",
+            self.name
+        ));
+        Box::pin(
+            futures::stream::once(async move {
+                tokio::time::sleep(d).await;
+                inner
+            })
+            .flatten(),
+        )
     }
 
     async fn list_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
@@ -493,7 +515,9 @@ impl ObjectStore for FaultStore {
             self.stats.err_before.fetch_add(1, Ordering::Relaxed);
             return Err(self.retryable("list_prefixes", prefix, "before"));
         }
-        self.inner.list_prefixes(prefix).await
+        let result = self.inner.list_prefixes(prefix).await;
+        self.delay_after("list_prefixes", prefix).await;
+        result
     }
 
     async fn signed_get_url(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
@@ -509,19 +533,21 @@ impl ObjectStore for FaultStore {
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
         let conditional = !matches!(opts.mode, PutMode::Overwrite);
-        match self.decide("compose", dest, true, conditional, false).await {
+        let result = match self.decide("compose", dest, true, conditional, false).await {
             Decision::Hang => hang_forever().await,
             Decision::ErrBefore => Err(self.retryable("compose", dest, "before")),
             Decision::CasFail => Err(StoreError::PreconditionFailed {
                 key: dest.into(),
                 current: None,
             }),
-            Decision::ErrAfter => {
-                let _ = self.inner.compose(dest, sources, opts).await?;
-                Err(self.retryable("compose", dest, "after (applied)"))
-            }
+            Decision::ErrAfter => match self.inner.compose(dest, sources, opts).await {
+                Ok(_) => Err(self.retryable("compose", dest, "after (applied)")),
+                Err(e) => Err(e),
+            },
             _ => self.inner.compose(dest, sources, opts).await,
-        }
+        };
+        self.delay_after("compose", dest).await;
+        result
     }
 }
 
@@ -564,6 +590,32 @@ mod tests {
             b"v"
         );
         assert_eq!(link.stats().err_after.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn response_delay_applies_after_mutations() {
+        let truth: DynStore = MemoryStore::shared();
+        let link = FaultStore::new(truth.clone(), "a", 1);
+        link.set(FaultPlan {
+            delay_after: Some(Duration::from_millis(20)),
+            ..Default::default()
+        });
+
+        let started = tokio::time::Instant::now();
+        link.put_bytes("k", b"v".to_vec(), PutMode::Overwrite)
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert_eq!(
+            truth.get_bytes("k").await.unwrap().unwrap().1,
+            b"v".as_slice()
+        );
+
+        let meta = truth.head("k").await.unwrap().unwrap();
+        let started = tokio::time::Instant::now();
+        link.delete("k", Some(meta.version)).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(truth.get_bytes("k").await.unwrap().is_none());
     }
 
     #[tokio::test]

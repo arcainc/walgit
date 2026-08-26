@@ -998,6 +998,176 @@ async fn run_safety_then_liveness(seed: u64) -> Result<()> {
     Ok(())
 }
 
+/// A slow object-store link must not turn a successful publish into an
+/// unobservable write. Each writer has independent request jitter and every
+/// response is delayed after the store operation, which permits concurrent
+/// CAS retries and late reads without weakening the truth-store oracle.
+async fn run_delayed_network_writers(seed: u64) -> Result<()> {
+    let c = Cluster::new(seed, 3).await?;
+    for inst in &c.instances {
+        inst.link.set(FaultPlan {
+            delay: Some((Duration::from_millis(15), Duration::from_millis(60))),
+            delay_after: Some(Duration::from_millis(40)),
+            ..Default::default()
+        });
+    }
+
+    let observer = c.observer();
+    let reader_registry = observer.registry.clone();
+    let reader_id = c.id.clone();
+    let (acks, mut received) = tokio::sync::mpsc::unbounded_channel::<Acked>();
+    let reader = tokio::spawn(async move {
+        while let Some(ack) = received.recv().await {
+            let handle = reader_registry.open(&reader_id).await?;
+            drop(
+                tokio::time::timeout(Duration::from_secs(10), handle.sync_refs())
+                    .await
+                    .map_err(|_| anyhow!("delayed reader timed out after seq {}", ack.seq))??,
+            );
+            let visible = handle
+                .local()
+                .refs()
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .refs
+                        .into_iter()
+                        .find(|r| r.name == ack.refname)
+                        .map(|r| r.oid)
+                })
+                .unwrap_or_default();
+            ensure!(
+                visible == ack.new,
+                "reader saw {} for {} after ACK seq {} (expected {})",
+                visible,
+                ack.refname,
+                ack.seq,
+                ack.new
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let mut writers = Vec::new();
+    for i in 0..c.instances.len() {
+        let inst = Instance {
+            name: format!("delayed-{i}"),
+            link: c.instances[i].link.clone(),
+            registry: c.instances[i].registry.clone(),
+            cfg: c.instances[i].cfg.clone(),
+            _cache: tempfile::tempdir().unwrap(),
+        };
+        let id = c.id.clone();
+        let acks = acks.clone();
+        writers.push(tokio::spawn(async move {
+            let mut p = Pusher::new(i);
+            for _ in 0..4 {
+                ensure!(
+                    p.push_once(&inst, &id, Duration::from_secs(15)).await?,
+                    "writer {i} failed: {:?}",
+                    p.errors.last()
+                );
+                acks.send(p.acked.last().cloned().unwrap()).unwrap();
+            }
+            Ok::<Pusher, anyhow::Error>(p)
+        }));
+    }
+    drop(acks);
+
+    let mut pushers = Vec::new();
+    for writer in writers {
+        pushers.push(writer.await??);
+    }
+    reader.await??;
+    check_truth(&c, &pushers).await
+}
+
+/// A response captured before a publish may arrive after the ACK. It must not
+/// roll a reader's local manifest backwards or make the next read stay stale.
+async fn run_delayed_snapshot_cannot_poison_reader(seed: u64) -> Result<()> {
+    let c = Cluster::new(seed, 2).await?;
+    let mut p = Pusher::new(0);
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+
+    let reader = c.instances[1].open(&c.id).await?;
+    drop(reader.sync_refs().await?);
+    let before = c.instances[1].link.stats().ops.load(Ordering::Relaxed);
+    c.instances[1].link.set(FaultPlan {
+        delay_after: Some(Duration::from_millis(250)),
+        ..FaultPlan::default().with_only(&["manifest.pb"])
+    });
+
+    let delayed = {
+        let reader = reader.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), reader.sync_refs())
+                .await
+                .map_err(|_| anyhow!("delayed snapshot timed out"))??;
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+    for _ in 0..100 {
+        if c.instances[1].link.stats().ops.load(Ordering::Relaxed) > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    ensure!(
+        c.instances[1].link.stats().ops.load(Ordering::Relaxed) > before,
+        "reader never issued the delayed manifest read"
+    );
+
+    ensure!(
+        p.push_once(&c.instances[0], &c.id, Duration::from_secs(10))
+            .await?
+    );
+    delayed.await??;
+
+    c.instances[1].link.heal();
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), reader.sync_refs())
+            .await
+            .map_err(|_| anyhow!("reader did not repair after delayed snapshot"))??,
+    );
+    let visible = reader
+        .local()
+        .refs()
+        .ok()
+        .and_then(|snapshot| {
+            snapshot
+                .refs
+                .into_iter()
+                .find(|r| r.name == p.refname)
+                .map(|r| r.oid)
+        })
+        .unwrap_or_default();
+    ensure!(
+        visible == p.tip,
+        "reader stayed at {visible}, expected {}",
+        p.tip
+    );
+    check_truth(&c, std::slice::from_ref(&p)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn sim_delayed_network_preserves_ack_visibility() {
+    for seed in [0xD1A5_0001, 0xD1A5_0002] {
+        run_delayed_network_writers(seed)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}: {e:#}"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sim_delayed_snapshot_cannot_poison_reader() {
+    run_delayed_snapshot_cannot_poison_reader(0xD1A5_0003)
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sim_safety_then_liveness() {
     for seed in seeds() {
