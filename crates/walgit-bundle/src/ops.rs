@@ -519,7 +519,7 @@ pub async fn cas_update_list<F>(
 where
     F: FnMut(Option<&BundleList>) -> Result<Option<BundleList>, BundleError>,
 {
-    let mut lease = acquire_list_lease(store, BUNDLE_LIST_LEASE_TTL, BUNDLE_LIST_LEASE_WAIT)
+    let mut lease = acquire_list_lease(store, BUNDLE_LIST_LEASE_TTL, BUNDLE_LIST_LEASE_WAIT, None)
         .await?
         .ok_or_else(|| BundleError::Other("bundle list lease held".into()))?;
     let result = cas_update_list_with_lease(
@@ -554,23 +554,14 @@ where
 {
     ensure_lease(strategy_lease, lease_ttl).await?;
     let list_lease_ttl = lease_ttl.min(BUNDLE_LIST_LEASE_TTL);
-    let mut list_lease = acquire_list_lease(store, list_lease_ttl, BUNDLE_LIST_LEASE_WAIT)
-        .await?
-        .ok_or_else(|| BundleError::Other("bundle list lease held".into()))?;
-    // `try_acquire_list_lease` already fenced the global token. This second
-    // fence only adds/validates the strategy token before the CAS loop.
-    let fence = fence_bundle_list(
+    let mut list_lease = acquire_list_lease(
         store,
-        &mut list_lease,
         list_lease_ttl,
+        BUNDLE_LIST_LEASE_WAIT,
         Some((strategy, strategy_lease.fencing_token())),
-        max_retries,
     )
-    .await;
-    if let Err(error) = fence {
-        let _ = list_lease.release().await;
-        return Err(error);
-    }
+    .await?
+    .ok_or_else(|| BundleError::Other("bundle list lease held".into()))?;
     let result = cas_update_list_with_lease(
         store,
         max_retries,
@@ -697,13 +688,14 @@ pub async fn try_acquire_list_lease(
     store: &Prefixed,
     ttl: Duration,
 ) -> Result<Option<LeaseGuard>, BundleError> {
-    acquire_list_lease(store, ttl, Duration::ZERO).await
+    acquire_list_lease(store, ttl, Duration::ZERO, None).await
 }
 
 async fn acquire_list_lease(
     store: &Prefixed,
     ttl: Duration,
     wait_up_to: Duration,
+    strategy: Option<(&str, u64)>,
 ) -> Result<Option<LeaseGuard>, BundleError> {
     let relative_key = keys::lease_key("bundle-list");
     let key = format!("{}{}", store.prefix(), relative_key);
@@ -720,7 +712,7 @@ async fn acquire_list_lease(
     let Some(mut lease) = lease else {
         return Ok(None);
     };
-    if let Err(error) = fence_bundle_list(store, &mut lease, ttl, None, 8).await {
+    if let Err(error) = fence_bundle_list(store, &mut lease, ttl, strategy, 8).await {
         let _ = lease.release().await;
         return match error {
             BundleError::LeaseLost => Ok(None),
@@ -844,33 +836,20 @@ pub async fn try_acquire_lease(
     // strategy takeover cannot mutate the list concurrently with a list
     // writer from another strategy.
     let list_lease_ttl = ttl.min(BUNDLE_LIST_LEASE_TTL);
-    let Some(mut list_lease) = try_acquire_list_lease(store, list_lease_ttl).await? else {
+    let Some(list_lease) = acquire_list_lease(
+        store,
+        list_lease_ttl,
+        Duration::ZERO,
+        Some((strategy, fencing_token)),
+    )
+    .await?
+    else {
         let _ = lease.release().await;
         return Ok(None);
     };
-    let fenced = fence_bundle_list(
-        store,
-        &mut list_lease,
-        list_lease_ttl,
-        Some((strategy, fencing_token)),
-        8,
-    )
-    .await;
     let list_release = list_lease.release().await;
-    match fenced {
-        Ok(()) => {
-            list_release.map_err(|e| BundleError::Other(e.to_string()))?;
-            Ok(Some(lease))
-        }
-        Err(BundleError::LeaseLost) => {
-            let _ = lease.release().await;
-            Ok(None)
-        }
-        Err(other) => {
-            let _ = lease.release().await;
-            Err(other)
-        }
-    }
+    list_release.map_err(|e| BundleError::Other(e.to_string()))?;
+    Ok(Some(lease))
 }
 
 /// Manually hold a lease for a strategy (prevents builds). Used in tests
