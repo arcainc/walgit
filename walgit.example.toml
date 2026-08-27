@@ -48,8 +48,8 @@ anonymous_read = true             # must be false in oidc mode
 #   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },
 #   { principal = "ci", token = "literal-secret", write = false },
 # ]
-# admin_emails = []                # oidc: emails that may PUT/DELETE settings and policy.json
-# admin_domains = []               # oidc: email domains that may PUT/DELETE settings and policy.json
+# admin_emails = []                # oidc: emails that may delete repos or PUT/DELETE settings and policy.json
+# admin_domains = []               # oidc: email domains that may delete repos or PUT/DELETE settings and policy.json
 # issuer = "https://id.example.com"        # oidc: discovery at <issuer>/.well-known/openid-configuration
 # allowed_domains = ["example.com"]        # oidc: email domains admitted (email_verified required)
 # allowed_emails = []                      # oidc: individual identities admitted
@@ -75,7 +75,7 @@ multipart_part_size = "32MiB"
 [store.s3]
 endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO
 region = "us-east-1"
-access_key_env = "AWS_ACCESS_KEY_ID"     # env var names read at runtime; unset = the SDK's default credential chain
+access_key_env = "AWS_ACCESS_KEY_ID"     # env var names read at runtime; AWS_SESSION_TOKEN is also honored when set
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
 force_path_style = false          # true for most self-hosted S3 implementations
 
