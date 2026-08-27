@@ -26,6 +26,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
@@ -34,6 +48,12 @@ jobs:
 
       - name: Store unit tests
         run: cargo test -p walgit-store --lib
+
+      - name: Build browser assets
+        run: just web-build
+
+      - name: Admin API authorization tests
+        run: cargo test -p walgit-server --test api_v1
 
       - name: Bundle correctness tests
         run: cargo test -p walgit-bundle --test bundle -- --nocapture
