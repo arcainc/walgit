@@ -8,8 +8,10 @@ missing blobs).
 
 ## 1. The invariant and where it can break
 The WAL guarantees *which* packs are live and *which* refs point where; it does not know whether the packs hold
-the refs' closure. Pushes cannot break it (receive-pack checks connectivity before publishing — that check is
-what surfaced the hole). What can:
+the refs' closure. With `wal.check_connectivity` enabled, receive-pack validates every non-deletion tip
+before publishing, including ref-only pushes with an empty pack or no pack. The HTTP tests in
+`crates/walgit-server/tests/receive_integrity.rs` reject missing targets and cold-clone the unchanged durable repository;
+valid ref-only branches and deletes remain supported. What else can break the invariant:
 - **Import**: a pack set built from one ref selection and a ref snapshot taken from another. the monorepo: the 32 GB base
   = closure of `main` + tags at `45371258`; the snapshot also carried `refs/remotes/origin/main` 479 commits
   ahead. `import --direct` now refuses this: every published tip (and by default its full closure,
@@ -73,3 +75,10 @@ finishes without redoing finished work; running it again on a completed import c
   phase in turn and resumed — every object uploaded exactly once across all runs, no second closure walk / history
   pack, one CAS, marker gone, then a second full run = no-op; a moved target → refused, `--force` → fresh start
   reusing the uploads.
+
+Receive validation uses an isolated object database containing only installed
+packs from the published manifest plus the current upload. Rejected or concurrent
+uploads in the shared cache cannot supply durable objects. The existing walk
+checks the requested closure; unrelated packs stored only remotely need not be
+materialized. Immutable hard links avoid copying pack bytes or issuing additional
+bucket requests, and the request read guard protects source packs during setup.

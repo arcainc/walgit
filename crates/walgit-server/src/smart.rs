@@ -1188,31 +1188,30 @@ async fn receive_pack_process(
         Err(e) => Some(format!("unpack failed: {e}")),
     };
 
-    // Connectivity check for pushed tips (before we publish anything).
+    // Ref-only pushes can carry an empty pack or no pack at all. Their new
+    // tips still need to exist before we publish refs that a clone will walk.
     if unpack_err.is_none() && st.cfg.wal.check_connectivity {
-        if let Ok(Some(_)) = &ingest {
-            let tips: Vec<gix_hash::ObjectId> = txn
-                .updates
-                .iter()
-                .filter(|u| !u.new_oid.is_empty() && !is_zero_oid(&u.new_oid))
-                .filter_map(|u| gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()).ok())
-                .collect();
-            if !tips.is_empty() {
-                if let Err(e) = local
-                    .check_connectivity_async(&tips, true)
-                    .instrument(tracing::info_span!(
-                        "receive.connectivity",
-                        tips = tips.len()
-                    ))
-                    .await
-                {
-                    // Every refusal names the reason on each ref: `unpack ng`
-                    // alone makes git print "remote failed to report status".
-                    tracing::warn!(repo = %route_id, error = %e, "receive-pack: connectivity check failed");
-                    metrics::counter!("walgit_push_refused_total", "reason" => "connectivity")
-                        .increment(1);
-                    return Ok(refusal_report(&caps, &txn, &format!("connectivity: {e}")).await);
-                }
+        let tips: Vec<gix_hash::ObjectId> = txn
+            .updates
+            .iter()
+            .filter(|u| !u.new_oid.is_empty() && !is_zero_oid(&u.new_oid))
+            .filter_map(|u| gix_hash::ObjectId::from_hex(u.new_oid.as_bytes()).ok())
+            .collect();
+        if !tips.is_empty() {
+            if let Err(e) = handle
+                .check_push_connectivity(&tips, ingest.as_ref().ok().and_then(Option::as_ref))
+                .instrument(tracing::info_span!(
+                    "receive.connectivity",
+                    tips = tips.len()
+                ))
+                .await
+            {
+                // Every refusal names the reason on each ref: `unpack ng`
+                // alone makes git print "remote failed to report status".
+                tracing::warn!(repo = %route_id, error = %e, "receive-pack: connectivity check failed");
+                metrics::counter!("walgit_push_refused_total", "reason" => "connectivity")
+                    .increment(1);
+                return Ok(refusal_report(&caps, &txn, &format!("connectivity: {e}")).await);
             }
         }
     }

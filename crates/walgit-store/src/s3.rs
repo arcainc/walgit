@@ -266,12 +266,9 @@ fn is_transient_status(status: u16) -> bool {
 ///
 /// The SDK retries transient failures itself (standard mode, three attempts)
 /// and surfaces what it could not absorb — but those leftovers are still
-/// transient, and walgit has its own, longer-horizon retry above them:
-/// `coord::cas_update` backs off and re-reads the manifest on `Retryable`, and
-/// `smart::wal_err` turns it into a 503 the git client can retry rather than a
-/// 500 it cannot. Everything here used to collapse into `Other`, so a
-/// throttled manifest CAS failed the push outright on S3 while the same
-/// throttle on GCS was absorbed.
+/// transient. Preserve that distinction for coordination retries and HTTP
+/// error mapping. Publication still resolves an ambiguous CAS by checking
+/// whether it landed; classification alone does not retry a whole Git push.
 fn is_retryable<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool
 where
     E: aws_sdk_s3::error::ProvideErrorMetadata,

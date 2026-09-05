@@ -103,6 +103,7 @@ test:
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
     {{t10}} cargo test -p walgit-server --test e2e {{ARGS}}
+    {{t10}} cargo test -p walgit-server --test receive_integrity {{ARGS}}
 
 # Zero rustc warnings, workspace-wide, all targets (tests, benches, examples).
 # Done by grepping the normal build instead of RUSTFLAGS=-D warnings, which would

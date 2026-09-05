@@ -368,6 +368,38 @@ impl RepoHandle {
         self.manifest_version.lock().clone()
     }
 
+    /// Check a push against durable objects plus its own upload. The request
+    /// keeps its ReadGuard alive until publication so these packs stay local.
+    pub async fn check_push_connectivity(
+        &self,
+        tips: &[gix_hash::ObjectId],
+        pack: Option<&walgit_git::IngestedPack>,
+    ) -> Result<(), WalError> {
+        let (mut packs, known_refs) = {
+            // Local ref application and manifest advancement share this lock.
+            // A newer hidden tip must not skip objects outside this inventory.
+            let _sync = self.sync_mutex.lock().await;
+            let manifest = self.manifest();
+            let packs = manifest
+                .packs
+                .iter()
+                .map(|pack| {
+                    gix_hash::ObjectId::from_hex(pack.checksum.as_bytes()).map_err(|error| {
+                        WalError::Corrupt(format!("invalid pack checksum: {error}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (packs, self.local.refs_arc()?)
+        };
+        if let Some(pack) = pack {
+            packs.push(pack.checksum);
+        }
+        self.local
+            .check_connectivity_in_packs_async(tips, packs, known_refs)
+            .await?;
+        Ok(())
+    }
+
     /// Last applied log entry sequence (local replay progress).
     pub fn applied_seq(&self) -> u64 {
         self.state.lock().applied_seq

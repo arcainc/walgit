@@ -124,7 +124,7 @@ impl Server {
         tokio::spawn(async move {
             axum::serve(
                 listener,
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                app.into_make_service_with_connect_info::<walgit_server::RequestPeer>(),
             )
             .with_graceful_shutdown(async move {
                 let _ = rx.await;
@@ -293,7 +293,7 @@ impl TestRepo {
         }
         stream.extend_from_slice(b"done\n");
 
-        let mut child = Command::new("git")
+        let mut child = git_command()
             .args(["fast-import", "--quiet", "--done"])
             .current_dir(&dir)
             .stdin(Stdio::piped())
@@ -331,7 +331,7 @@ impl std::ops::Deref for TestRepo {
 
 /// Run `git` with `args` in `cwd`.
 pub fn git(args: &[&str], cwd: &Path) -> Result<()> {
-    let out = Command::new("git").current_dir(cwd).args(args).output()?;
+    let out = git_command().current_dir(cwd).args(args).output()?;
     ensure!(
         out.status.success(),
         "git {} failed: {}",
@@ -343,7 +343,7 @@ pub fn git(args: &[&str], cwd: &Path) -> Result<()> {
 
 /// Run `git` in `dir`, returning stdout.
 pub fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").current_dir(dir).args(args).output()?;
+    let out = git_command().current_dir(dir).args(args).output()?;
     ensure!(
         out.status.success(),
         "git {} failed: {}",
@@ -351,4 +351,21 @@ pub fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
         String::from_utf8_lossy(&out.stderr)
     );
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    // Commit hooks export repository context; a temporary-repo test must
+    // never resolve its index or objects through the checkout running it.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(key);
+    }
+    command
 }

@@ -513,8 +513,20 @@ impl axum::serve::Listener for NodelayListener {
     }
 }
 
+/// Connection metadata consumed by the router. External listeners must use
+/// `into_make_service_with_connect_info::<RequestPeer>()` too, so trusted
+/// loopback-only capabilities retain the same peer checks as `serve`.
 #[derive(Clone, Copy)]
-struct RequestPeer(std::net::SocketAddr);
+pub struct RequestPeer(std::net::SocketAddr);
+
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for RequestPeer
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
 
 impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NodelayListener>>
     for RequestPeer
