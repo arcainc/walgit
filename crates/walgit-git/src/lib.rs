@@ -1506,11 +1506,25 @@ impl LocalRepo {
         tips: &[gix_hash::ObjectId],
         stop_at_existing_refs: bool,
     ) -> Result<(), GitError> {
+        let known_refs = if stop_at_existing_refs {
+            Some(self.refs_arc()?)
+        } else {
+            None
+        };
+        self.check_connectivity_in(&self.gix(), tips, known_refs.as_deref())
+    }
+
+    fn check_connectivity_in(
+        &self,
+        repo: &gix::Repository,
+        tips: &[gix_hash::ObjectId],
+        known_refs: Option<&RefSnapshotData>,
+    ) -> Result<(), GitError> {
         let span = tracing::info_span!(
             "git.check_connectivity",
             repo = %self.inner.id,
             tips = tips.len(),
-            stop_at_existing_refs,
+            stop_at_existing_refs = known_refs.is_some(),
         );
         let _enter = span.enter();
 
@@ -1528,7 +1542,6 @@ impl LocalRepo {
             return Ok(());
         }
 
-        let repo = self.gix();
         let mut seen: HashSet<gix_hash::ObjectId> = HashSet::new();
         let mut buf = Vec::new();
         let mut tree_state = gix_traverse::tree::breadthfirst::State::default();
@@ -1574,8 +1587,7 @@ impl LocalRepo {
         }
 
         // Collect hidden tips (existing ref tips, peeled to commits) for stop-at-existing.
-        let hidden: Vec<gix_hash::ObjectId> = if stop_at_existing_refs {
-            let snap = self.refs()?;
+        let hidden: Vec<gix_hash::ObjectId> = if let Some(snap) = known_refs {
             let mut seen_hidden = HashSet::with_capacity(snap.refs.len());
             let mut out = Vec::with_capacity(snap.refs.len());
             for r in &snap.refs {
@@ -1679,6 +1691,61 @@ impl LocalRepo {
         tokio::task::spawn_blocking(move || this.check_connectivity(&tips, stop_at_existing_refs))
             .await
             .map_err(|e| GitError::Protocol(format!("connectivity task: {e}")))?
+    }
+
+    /// Validate against a fixed published pack inventory plus the current
+    /// upload, excluding rejected/concurrent uploads and loose cache objects.
+    /// Links share immutable bytes; the caller holds the WAL read guard so
+    /// compaction cannot unlink source packs while this view is constructed.
+    pub async fn check_connectivity_in_packs_async(
+        &self,
+        tips: &[gix_hash::ObjectId],
+        packs: Vec<gix_hash::ObjectId>,
+        known_refs: Arc<RefSnapshotData>,
+    ) -> Result<(), GitError> {
+        let this = self.clone();
+        let tips = tips.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let scratch = this
+                .inner
+                .path
+                .join(format!("walgit-connectivity-{}", unique_suffix()));
+            let _cleanup = ScratchDir(scratch.clone());
+            let pack_dir = scratch.join("pack");
+            std::fs::create_dir_all(&pack_dir)?;
+            let mut linked = HashSet::new();
+            for checksum in packs {
+                if !linked.insert(checksum) {
+                    continue;
+                }
+                let source = this.pack_path(&checksum);
+                // Refs-only sync can advertise a pack that is not installed
+                // here; remote-served base packs may never be local. Only the
+                // objects actually reached by this walk need to be present.
+                if !source.try_exists()? || !source.with_extension("idx").try_exists()? {
+                    continue;
+                }
+                for extension in ["pack", "idx"] {
+                    std::fs::hard_link(
+                        source.with_extension(extension),
+                        pack_dir.join(format!("pack-{}.{}", checksum.to_hex(), extension)),
+                    )?;
+                }
+            }
+            let mut repo = this.gix();
+            repo.objects = gix_odb::at_opts(
+                &scratch,
+                std::iter::empty(),
+                gix_odb::store::init::Options {
+                    object_hash: repo.object_hash(),
+                    ..Default::default()
+                },
+            )?
+            .into();
+            this.check_connectivity_in(&repo, &tips, Some(&known_refs))
+        })
+        .await
+        .map_err(|e| GitError::Protocol(format!("connectivity task: {e}")))?
     }
 
     // ---- protocol, server side ----

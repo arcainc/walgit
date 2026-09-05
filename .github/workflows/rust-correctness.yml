@@ -55,6 +55,11 @@ jobs:
       - name: Admin API authorization tests
         run: cargo test -p walgit-server --test api_v1
 
+      - name: Smart HTTP integrity and LFS contracts
+        run: |
+          cargo test -p walgit-server --test receive_integrity --test lfs_upstream
+          cargo test -p walgit-server --test e2e lfs_upload_batch_requires_write_permission
+
       - name: Bundle correctness tests
         run: cargo test -p walgit-bundle --test bundle -- --nocapture
 
